@@ -18,6 +18,15 @@ from multiprocessing import Pool
 
 from avaframe.com4FlowPy.flowClass import Cell
 
+try:
+    import avaframe.com4FlowPy.sycl.sycl_core as sycl_core
+    HAS_SYCL = True
+except ImportError as e:
+    import logging
+    logging.getLogger(__name__).warning("Failed to import C++/SYCL core: %s" % e)
+    HAS_SYCL = False
+
+
 
 def get_start_idx(dem, release):
     """Sort Release Pixels by altitude and return the result as lists for the
