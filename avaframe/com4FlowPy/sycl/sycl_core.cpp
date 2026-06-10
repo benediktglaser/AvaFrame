@@ -21,7 +21,7 @@ py::tuple run_sycl_calculation(
     float nodata,
     std::string device_type
 ) {
-    // Extract pointer and dimension info from Python arrays
+    // Extract info from Python arrays
     py::buffer_info dem_info = dem_arr.request();
     py::buffer_info rel_info = release_arr.request();
     

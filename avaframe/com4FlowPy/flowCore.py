@@ -18,12 +18,23 @@ from multiprocessing import Pool
 
 from avaframe.com4FlowPy.flowClass import Cell
 
+from avaframe.in3Utils import cfgUtils
+
 try:
-    import avaframe.com4FlowPy.sycl.sycl_core as sycl_core
-    HAS_SYCL = True
-except ImportError as e:
-    import logging
-    logging.getLogger(__name__).warning("Failed to import C++/SYCL core: %s" % e)
+    cfg = cfgUtils.getGeneralConfig()
+    useSycl = cfg["FLAGS"].getboolean("useSycl")
+except Exception:
+    useSycl = False
+
+if useSycl:
+    try:
+        import avaframe.com4FlowPy.sycl.sycl_core as sycl_core
+        HAS_SYCL = True
+    except ImportError as e:
+        import logging
+        logging.getLogger(__name__).warning("Failed to import SYCL core: %s" % e)
+        HAS_SYCL = False
+else:
     HAS_SYCL = False
 
 
