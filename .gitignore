@@ -54,3 +54,14 @@ avaframe/com1DFA/*.so
 *.rcf
 /avaframe/data/tmpStdTests/
 /wheelhouse/
+
+# IDE / Compiler cache files
+.cache/
+.vscode/
+compile_commands.json
+pyrightconfig.json
+
+# C++ compiled modules
+avaframe/com4FlowPy/sycl/build/
+avaframe/com4FlowPy/sycl/.cache/
+avaframe/com4FlowPy/sycl/*.so

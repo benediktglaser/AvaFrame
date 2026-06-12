@@ -11,19 +11,27 @@ namespace py = pybind11;
 namespace sycl_flow {
 
 py::tuple run_sycl_calculation(
-    py::array_t<float> dem_arr,
-    py::array_t<float> release_arr,
+    py::array_t<float> dem,
+    py::array_t<float> release,
+    py::object infra,                      // none or np.ndarray
     float alpha,
-    int exp,
+    float exp,
     float flux_threshold,
     float max_z_delta,
-    float cellsize,
     float nodata,
+    float cellsize,
+    bool infraBool,
+    bool forestBool,
+    py::dict varParams,
+    bool fluxDistOldVersionBool,
+    bool previewMode,
+    py::object forestArray,                // none or np.ndarray
+    py::object forestParams,               // none or py::dict
     std::string device_type
 ) {
-    // Extract info from Python arrays
-    py::buffer_info dem_info = dem_arr.request();
-    py::buffer_info rel_info = release_arr.request();
+    // extract info from python arrays
+    py::buffer_info dem_info = dem.request();
+    py::buffer_info rel_info = release.request();
     
     int rows = dem_info.shape[0];
     int cols = dem_info.shape[1];
@@ -31,8 +39,65 @@ py::tuple run_sycl_calculation(
     
     float* dem_ptr = static_cast<float*>(dem_info.ptr);
     float* rel_ptr = static_cast<float*>(rel_info.ptr);
-    
-    // Select execution device
+
+    // none checking
+    float* infra_ptr = nullptr;
+    if (infraBool && !infra.is_none()) {
+        auto infra_arr = infra.cast<py::array_t<float>>();
+        infra_ptr = static_cast<float*>(infra_arr.request().ptr);
+    }
+    float* forest_ptr = nullptr;
+    if (forestBool && !forestArray.is_none()) {
+        auto forest_arr = forestArray.cast<py::array_t<float>>();
+        forest_ptr = static_cast<float*>(forest_arr.request().ptr);
+    }
+
+    // unpack varParams
+    bool varUmaxBool = varParams["varUmaxBool"].cast<bool>();
+    float* varUmax_ptr = nullptr;
+    if (varUmaxBool && !varParams["varUmaxArray"].is_none()) {
+        auto umax_arr = varParams["varUmaxArray"].cast<py::array_t<float>>();
+        varUmax_ptr = static_cast<float*>(umax_arr.request().ptr);
+    }
+    bool varAlphaBool = varParams["varAlphaBool"].cast<bool>();
+    float* varAlpha_ptr = nullptr;
+    if (varAlphaBool && !varParams["varAlphaArray"].is_none()) {
+        auto valpha_arr = varParams["varAlphaArray"].cast<py::array_t<float>>();
+        varAlpha_ptr = static_cast<float*>(valpha_arr.request().ptr);
+    }
+    bool varExponentBool = varParams["varExponentBool"].cast<bool>();
+    float* varExponent_ptr = nullptr;
+    if (varExponentBool && !varParams["varExponentArray"].is_none()) {
+        auto vexponent_arr = varParams["varExponentArray"].cast<py::array_t<float>>();
+        varExponent_ptr = static_cast<float*>(vexponent_arr.request().ptr);
+    }
+
+    // unpack forestParams
+    bool forestInteraction = false;
+    std::string forestModule = "";
+    float maxAddedFrictionFor = 0.0f;
+    float minAddedFrictionFor = 0.0f;
+    float velThForFriction = 0.0f;
+    float maxDetrainmentFor = 0.0f;
+    float minDetrainmentFor = 0.0f;
+    float velThForDetrain = 0.0f;
+    std::string forestFrictionLayerType = "";
+    float skipForestDist = 0.0f;
+    if (forestBool && !forestParams.is_none()) {
+        py::dict fp = forestParams.cast<py::dict>();
+        forestInteraction = fp["forestInteraction"].cast<bool>();
+        forestModule = fp["forestModule"].cast<std::string>();
+        maxAddedFrictionFor = fp["maxAddedFrictionFor"].cast<float>();
+        minAddedFrictionFor = fp["minAddedFrictionFor"].cast<float>();
+        velThForFriction = fp["velThForFriction"].cast<float>();
+        maxDetrainmentFor = fp["maxDetrainmentFor"].cast<float>();
+        minDetrainmentFor = fp["minDetrainmentFor"].cast<float>();
+        velThForDetrain = fp["velThForDetrain"].cast<float>();
+        forestFrictionLayerType = fp["forestFrictionLayerType"].cast<std::string>();
+        skipForestDist = fp["skipForestDist"].cast<float>();
+    }
+
+    // select execution device
     sycl::device dev;
     if (device_type == "gpu") {
         try {

@@ -234,6 +234,59 @@ def run(optTuple):
     nRel = np.sum(release)
     log.info("Number of release cells: %i" % nRel)
 
+    if HAS_SYCL:
+        log.info("Running calculation with C++/SYCL core.")
+        zDeltaArray, fluxArray, countArray = sycl_core.run_sycl_calculation(
+            dem,
+            release,
+            infra,
+            alpha,
+            exp,
+            flux_threshold,
+            max_z_delta,
+            nodata,
+            cellsize,
+            infraBool,
+            forestBool,
+            varParams,
+            fluxDistOldVersionBool,
+            previewMode,
+            forestArray,
+            forestParams,
+            "gpu"
+        )
+        
+        # initializing arrays for storing the results
+        zDeltaSumArray = np.zeros_like(dem, dtype=np.float32)
+        routFluxSumArray = np.zeros_like(dem, dtype=np.float32)
+        depFluxSumArray = np.zeros_like(dem, dtype=np.float32)
+        fpTravelAngleMaxArray = np.ones_like(dem, dtype=np.float32) * -9999
+        fpTravelAngleMinArray = np.ones_like(dem, dtype=np.float32) * -9999
+        slTravelAngleArray = np.ones_like(dem, dtype=np.float32) * -9999
+        travelLengthMaxArray = np.ones_like(dem, dtype=np.float32) * -9999
+        travelLengthMinArray = np.ones_like(dem, dtype=np.float32) * -9999
+        
+        # Save results directly
+        np.save(tempDir / ("res_z_delta_%s_%s" % (optTuple[0], optTuple[1])), zDeltaArray)
+        np.save(tempDir / ("res_z_delta_sum_%s_%s" % (optTuple[0], optTuple[1])), zDeltaSumArray)
+        np.save(tempDir / ("res_rout_flux_sum_%s_%s" % (optTuple[0], optTuple[1])), routFluxSumArray)
+        np.save(tempDir / ("res_dep_flux_sum_%s_%s" % (optTuple[0], optTuple[1])), depFluxSumArray)
+        np.save(tempDir / ("res_flux_%s_%s" % (optTuple[0], optTuple[1])), fluxArray)
+        np.save(tempDir / ("res_count_%s_%s" % (optTuple[0], optTuple[1])), countArray)
+        np.save(tempDir / ("res_fp_max_%s_%s" % (optTuple[0], optTuple[1])), fpTravelAngleMaxArray)
+        np.save(tempDir / ("res_fp_min_%s_%s" % (optTuple[0], optTuple[1])), fpTravelAngleMinArray)
+        np.save(tempDir / ("res_sl_%s_%s" % (optTuple[0], optTuple[1])), slTravelAngleArray)
+        np.save(tempDir / ("res_travel_length_max_%s_%s" % (optTuple[0], optTuple[1])), travelLengthMaxArray)
+        np.save(tempDir / ("res_travel_length_min_%s_%s" % (optTuple[0], optTuple[1])), travelLengthMinArray)
+        if infraBool:
+            backcalc = np.ones_like(dem, dtype=np.int32) * -9999
+            np.save(tempDir / ("res_backcalc_%s_%s" % (optTuple[0], optTuple[1])), backcalc)
+        if forestInteraction:
+            forestIntArray = np.ones_like(dem, dtype=np.float32) * -9999
+            np.save(tempDir / ("res_forestInt_%s_%s" % (optTuple[0], optTuple[1])), forestIntArray)
+            
+        return
+
     nProcesses, nChunks = calculateMultiProcessingOptions(
         nRel,
         MPOptions["nCPU"],
