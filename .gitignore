@@ -65,3 +65,7 @@ pyrightconfig.json
 avaframe/com4FlowPy/sycl/build/
 avaframe/com4FlowPy/sycl/.cache/
 avaframe/com4FlowPy/sycl/*.so
+
+# Local run/test data and config files
+*_com1DFACfg.ini
+/data/

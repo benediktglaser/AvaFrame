@@ -253,7 +253,7 @@ def run(optTuple):
             previewMode,
             forestArray,
             forestParams,
-            "gpu"
+            "cpu"
         )
         
         # initializing arrays for storing the results
@@ -544,6 +544,7 @@ def calculation(args):
     zDeltaSumArray = np.zeros_like(dem, dtype=np.float32)
     zDeltaPathList = []
     routFluxSumArray = np.zeros_like(dem, dtype=np.float32)
+
     depFluxSumArray = np.zeros_like(dem, dtype=np.float32)
     fluxArray = np.ones_like(dem, dtype=np.float32) * -9999
     countArray = np.zeros_like(dem, dtype=np.int32)
