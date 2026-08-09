@@ -216,6 +216,61 @@ def test_calculation():
     assert np.all(results[11] == depFluxSum)
     assert np.all(results[8] == travelLengthMin)
     assert np.all(results[7] == np.ones_like(flux) * -9999)
+def test_sycl_equivalence():
+    """
+    Test that the C++/SYCL core produces the same results as the Python core
+    """
+    try:
+        import avaframe.com4FlowPy.sycl.sycl_core as sycl_core
+    except ImportError:
+        pytest.skip("SYCL core not compiled or available")
+    
+    dem = np.array(
+        [[40, 40, 40, 40, 40], [30, 30, 30, 30, 30], [20, 20, 20, 20, 20], [10, 10, 10, 10, 10], [0, 0, 0, 0, 0]],
+        dtype=np.float32
+    )
+    infra = None
+    pra = np.array([[0, 0, 0, 0, 0], [0, 0, 1, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [0, 0, 0, 0, 0]], dtype=np.float32)
+    alpha = 10.0
+    exp = 8.0
+    fluxTh = 0.0003
+    zDeltaMax = 8848.0
+    nodata = -9999.0
+    cellsize = 10.0
+    infraBool = False
+    forestBool = False
+    variableParameters = {
+        "varUmaxBool": False,
+        "varUmaxArray": None,
+        "varAlphaBool": False,
+        "varAlphaArray": None,
+        "varExponentBool": False,
+        "varExponentArray": None,
+    }
+    fluxDistOldVersionBool = False
+    previewMode = False
+    forestArray = None
+    forestParams = None
+
+    # Run Python core
+    args = [dem, infra, pra, alpha, exp, fluxTh, zDeltaMax, nodata, cellsize, infraBool, forestBool, variableParameters,
+            fluxDistOldVersionBool, previewMode, forestArray, forestParams, []]
+    res_py = flowCore.calculation(args)
+
+    # Run SYCL core
+    res_sycl = sycl_core.run_sycl_calculation(
+        dem, pra, infra, alpha, exp, fluxTh, zDeltaMax, nodata, cellsize,
+        infraBool, forestBool, variableParameters, fluxDistOldVersionBool,
+        previewMode, forestArray, forestParams, "cpu"
+    )
+
+    # Compare outputs
+    # zDeltaArray
+    assert np.allclose(res_py[0], res_sycl[0])
+    # fluxArray
+    assert np.allclose(res_py[1], res_sycl[1])
+    # countArray
+    assert np.all(res_py[2] == res_sycl[2])
 
 
 if __name__=='__main__':
@@ -223,3 +278,4 @@ if __name__=='__main__':
     test_reverseTopology()
     test_backTracking()
     test_calculation()
+    test_sycl_equivalence()

@@ -236,7 +236,7 @@ def run(optTuple):
 
     if HAS_SYCL:
         log.info("Running calculation with C++/SYCL core.")
-        zDeltaArray, fluxArray, countArray = sycl_core.run_sycl_calculation(
+        zDeltaArray, fluxArray, countArray, backcalc, forestIntArray = sycl_core.run_sycl_calculation(
             dem,
             release,
             infra,
@@ -279,10 +279,9 @@ def run(optTuple):
         np.save(tempDir / ("res_travel_length_max_%s_%s" % (optTuple[0], optTuple[1])), travelLengthMaxArray)
         np.save(tempDir / ("res_travel_length_min_%s_%s" % (optTuple[0], optTuple[1])), travelLengthMinArray)
         if infraBool:
-            backcalc = np.ones_like(dem, dtype=np.int32) * -9999
+            backcalc = backcalc.astype(np.int32)
             np.save(tempDir / ("res_backcalc_%s_%s" % (optTuple[0], optTuple[1])), backcalc)
         if forestInteraction:
-            forestIntArray = np.ones_like(dem, dtype=np.float32) * -9999
             np.save(tempDir / ("res_forestInt_%s_%s" % (optTuple[0], optTuple[1])), forestIntArray)
             
         return

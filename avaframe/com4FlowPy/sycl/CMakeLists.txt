@@ -38,3 +38,8 @@ add_sycl_to_target(TARGET sycl_core SOURCES sycl_core.cpp)
 # Output build properties for user info
 message(STATUS "Build target: sycl_core")
 message(STATUS "AdaptiveCpp Compiler & Flags applied automatically by CMake.")
+
+# Automatically copy the built module to the source directory for Python discovery
+add_custom_command(TARGET sycl_core POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:sycl_core> ${CMAKE_CURRENT_SOURCE_DIR}/
+)

@@ -4,7 +4,6 @@ import numpy as np
 import avaframe.com4FlowPy.sycl.sycl_core as sycl_core
 import avaframe.com4FlowPy.flowCore as flowCore
 
-
 # DEM with merging paths (diagonal slope)
 dem = np.zeros((5, 5), dtype=np.float32)
 for r in range(5):
@@ -23,92 +22,120 @@ varParams = {
     "varExponentArray": None,
 }
 
-print("\nInputs:")
-print("DEM \n", dem)
-print("Release Grid \n", rel)
+def compare_results(name, sycl_res, py_res, tol=1e-5):
+    sycl_cleaned = np.where(sycl_res == -9999.0, 0.0, sycl_res)
+    py_cleaned = np.where(py_res == -9999.0, 0.0, py_res)
+    match = np.allclose(sycl_cleaned, py_cleaned, atol=tol)
+    print(f"{name} Match: {match}")
+    if not match:
+        print("SYCL:")
+        print(sycl_cleaned)
+        print("Python:")
+        print(py_cleaned)
+    return match
 
-
-# --- Run SYCL implementation ---
-print("\nInvoking C++/SYCL core...")
-z_sycl, f_sycl, c_sycl = sycl_core.run_sycl_calculation(
-    dem,
-    rel,
-    None,
-    30.0,
-    3.0,
-    3e-4,
-    270.0,
-    -9999.0,
-    10.0,
-    False,
-    False,
-    varParams,
-    False,
-    False,
-    None,
-    None,
-    "cpu"
+# ==========================================
+# TEST 1: Base Correctness (No Forest/Infra)
+# ==========================================
+print("\n--- RUNNING TEST 1: Base Correctness ---")
+z_sycl, f_sycl, c_sycl, b_sycl, fo_sycl = sycl_core.run_sycl_calculation(
+    dem, rel, None, 30.0, 3.0, 3e-4, 270.0, -9999.0, 10.0,
+    False, False, varParams, False, False, None, None, "cpu"
 )
 
-
-# --- Run Python implementation ---
-print("\nInvoking Python core...")
 outputs = ['zDelta', 'flux', 'cellCounts']
 args = [
-    dem,
-    None,
-    rel,
-    30.0,
-    3.0,
-    3e-4,
-    270.0,
-    -9999.0,
-    10.0,
-    False,
-    False,
-    varParams,
-    False,
-    False,
-    None,
-    None,
-    outputs
+    dem, None, rel, 30.0, 3.0, 3e-4, 270.0, -9999.0, 10.0,
+    False, False, varParams, False, False, None, None, outputs
 ]
+res_py = flowCore.calculation(args)
+z_py, f_py, c_py = res_py[0], res_py[1], res_py[2]
 
-results_py = flowCore.calculation(args)
-z_py = results_py[0]
-f_py = results_py[1]
-c_py = results_py[2]
+t1_z = compare_results("zDelta", z_sycl, z_py)
+t1_f = compare_results("flux", f_sycl, f_py)
+t1_c = np.array_equal(c_sycl, c_py)
+print(f"Counts Match: {t1_c}")
 
+test1_success = t1_z and t1_f and t1_c
 
-# --- Compare Results ---
+# ==========================================
+# TEST 2: Infrastructure Correctness
+# ==========================================
+print("\n--- RUNNING TEST 2: Infrastructure Backtracking ---")
+infra = np.zeros((5, 5), dtype=np.float32)
+infra[3, 3] = 4.0
+infra[4, 2] = 2.0
 
-# Clean up unvisited/no-data values for cleaner comparison
-# Python initializes unvisited flux elements to -9999.0, whereas C++ starts them at 0.0.
-z_sycl_cleaned = np.where(z_sycl == -9999.0, 0.0, z_sycl)
-z_py_cleaned = np.where(z_py == -9999.0, 0.0, z_py)
-f_sycl_cleaned = np.where(f_sycl == -9999.0, 0.0, f_sycl)
-f_py_cleaned = np.where(f_py == -9999.0, 0.0, f_py)
+z_sycl, f_sycl, c_sycl, b_sycl, fo_sycl = sycl_core.run_sycl_calculation(
+    dem, rel, infra, 30.0, 3.0, 3e-4, 270.0, -9999.0, 10.0,
+    True, False, varParams, False, False, None, None, "cpu"
+)
 
-print("\n--- zDelta ---")
-print("SYCL:\n", z_sycl_cleaned)
-print("Python:\n", z_py_cleaned)
-z_match = np.allclose(z_sycl_cleaned, z_py_cleaned, atol=1e-5)
-print(f"Match: {z_match}")
+args[1] = infra
+args[9] = True
+res_py = flowCore.calculation(args)
+z_py, f_py, c_py, _, b_py = res_py[0], res_py[1], res_py[2], res_py[3], res_py[4]
 
-print("\n--- flux ---")
-print("SYCL:\n", f_sycl_cleaned)
-print("Python:\n", f_py_cleaned)
-f_match = np.allclose(f_sycl_cleaned, f_py_cleaned, atol=1e-5)
-print(f"Match: {f_match}")
+t2_z = compare_results("zDelta", z_sycl, z_py)
+t2_f = compare_results("flux", f_sycl, f_py)
+t2_c = np.array_equal(c_sycl, c_py)
+print(f"Counts Match: {t2_c}")
+t2_b = compare_results("backcalc", b_sycl, b_py)
 
-print("\n--- counts ---")
-print("SYCL:\n", c_sycl)
-print("Python:\n", c_py)
-c_match = np.array_equal(c_sycl, c_py)
-print(f"Match: {c_match}")
+test2_success = t2_z and t2_f and t2_c and t2_b
 
-if z_match and f_match and c_match:
-    print("\nSUCCESS")
+# ==========================================
+# TEST 3: Forest Interaction Correctness
+# ==========================================
+print("\n--- RUNNING TEST 3: Forest Interaction ---")
+forestArray = np.zeros((5, 5), dtype=np.float32)
+forestArray[2, 2] = 1.0
+forestArray[3, 2] = 1.0
+
+forestParams = {
+    "forestInteraction": True,
+    "forestModule": "forestFriction",
+    "maxAddedFriction": 10.0,
+    "minAddedFriction": 2.0,
+    "velThForFriction": 5.0,
+    "maxDetrainment": 0.5,
+    "minDetrainment": 0.1,
+    "velThForDetrain": 3.0,
+    "fFrLayerType": "absolute",
+    "skipForestDist": 1.0,
+}
+
+z_sycl, f_sycl, c_sycl, b_sycl, fo_sycl = sycl_core.run_sycl_calculation(
+    dem, rel, None, 30.0, 3.0, 3e-4, 270.0, -9999.0, 10.0,
+    False, True, varParams, False, False, forestArray, forestParams, "cpu"
+)
+
+args[1] = None
+args[9] = False
+args[10] = True
+args[14] = forestArray
+args[15] = forestParams
+
+res_py = flowCore.calculation(args)
+z_py, f_py, c_py = res_py[0], res_py[1], res_py[2]
+# In forestInteraction mode, calculation returns 13 elements. forestIntArray is at index 12.
+fo_py = res_py[12]
+
+t3_z = compare_results("zDelta", z_sycl, z_py)
+t3_f = compare_results("flux", f_sycl, f_py)
+t3_c = np.array_equal(c_sycl, c_py)
+print(f"Counts Match: {t3_c}")
+t3_fo = compare_results("forestInt", fo_sycl, fo_py)
+
+test3_success = t3_z and t3_f and t3_c and t3_fo
+
+# ==========================================
+# Final Verdict
+# ==========================================
+print("\n==========================================")
+if test1_success and test2_success and test3_success:
+    print("ALL TESTS PASSED SUCCESSFULLY!")
     sys.exit(0)
 else:
-    print("\nFAILURE")
+    print("SOME TESTS FAILED!")
+    sys.exit(1)

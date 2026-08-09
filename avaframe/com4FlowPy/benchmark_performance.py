@@ -30,14 +30,14 @@ varParams = {
 
 # Warm-up
 print("Warming up SYCL core (JIT compilation)...")
-_, _, _ = sycl_core.run_sycl_calculation(
+_, _, _, _, _ = sycl_core.run_sycl_calculation(
     dem, rel, None, 30.0, 3.0, 3e-4, 270.0, -9999.0, 10.0,
     False, False, varParams, False, False, None, None, "cpu"
 )
 
 # Sycl
 start_sycl = time.perf_counter()
-z_sycl, f_sycl, c_sycl = sycl_core.run_sycl_calculation(
+z_sycl, f_sycl, c_sycl, b_sycl, fo_sycl = sycl_core.run_sycl_calculation(
     dem, rel, None, 30.0, 3.0, 3e-4, 270.0, -9999.0, 10.0,
     False, False, varParams, False, False, None, None, "cpu"
 )
