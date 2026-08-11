@@ -239,10 +239,16 @@ def run(optTuple):
         log.info("Running calculation with C++/SYCL core.")
         device_type = "gpu" if "gpu" in target else "cpu"
 
+        # Explicitly ensure C-contiguous float32 arrays before passing to C++
+        dem_f32 = np.ascontiguousarray(dem, dtype=np.float32)
+        rel_f32 = np.ascontiguousarray(release, dtype=np.float32)
+        infra_f32 = np.ascontiguousarray(infra, dtype=np.float32) if infraBool and isinstance(infra, np.ndarray) else None
+        forest_f32 = np.ascontiguousarray(forestArray, dtype=np.float32) if isinstance(forestArray, np.ndarray) else None
+
         zDeltaArray, fluxArray, countArray, backcalc, forestIntArray = sycl_core.run_sycl_calculation(
-            dem,
-            release,
-            infra,
+            dem_f32,
+            rel_f32,
+            infra_f32,
             alpha,
             exp,
             flux_threshold,
@@ -254,7 +260,7 @@ def run(optTuple):
             varParams,
             fluxDistOldVersionBool,
             previewMode,
-            forestArray,
+            forest_f32,
             forestParams,
             device_type
         )
