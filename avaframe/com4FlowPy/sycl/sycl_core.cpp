@@ -132,6 +132,10 @@ py::tuple run_sycl_calculation(
         }
     }
     int num_release_cells = release_flat_indices.size();
+    std::sort(release_flat_indices.begin(), release_flat_indices.end(), [&](int a, int b) {
+        return dem_ptr[a] > dem_ptr[b];
+    });
+    std::cout << "SYCL_CORE DEBUG: total_cells=" << total_cells << ", num_release_cells=" << num_release_cells << std::endl;
 
     // select execution device
     sycl::device dev;
