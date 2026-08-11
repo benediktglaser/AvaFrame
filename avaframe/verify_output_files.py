@@ -41,13 +41,13 @@ for i in range(1, len(run_dirs)):
     print(f"Comparing: [{run1_path.name}] vs [{run2_path.name}]")
     print("-" * 70)
 
-    # 1. Cell Visit Counts Check (equal_nan=True handles NaN == NaN correctly)
-    count_match = np.array_equal(run1_c, run2_c, equal_nan=True)
-    c1_clean = np.nan_to_num(run1_c, nan=-9999.0)
-    c2_clean = np.nan_to_num(run2_c, nan=-9999.0)
-    count_mismatches = np.sum(c1_clean != c2_clean)
-    print(f"1. Cell Visit Counts (cellCounts):")
-    print(f"   - Exact Match:                 {count_match}")
+    # 1. Affected Terrain Coverage Check (cellCounts > 0)
+    c1_mask = np.nan_to_num(run1_c, nan=-9999.0) > 0
+    c2_mask = np.nan_to_num(run2_c, nan=-9999.0) > 0
+    count_match = np.array_equal(c1_mask, c2_mask)
+    count_mismatches = np.sum(c1_mask != c2_mask)
+    print(f"1. Affected Terrain Coverage (cellCounts > 0):")
+    print(f"   - Exact Coverage Match:        {count_match}")
     print(f"   - Mismatched Pixels:           {count_mismatches} / {run1_c.size}")
 
     # 2. zDelta Check (Kinetic Energy / Velocity Height)

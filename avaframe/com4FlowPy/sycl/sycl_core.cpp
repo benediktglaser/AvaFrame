@@ -173,19 +173,19 @@ py::tuple run_sycl_calculation(
     float* forest_data = forest_ptr ? forest_ptr : dummy.data();
 
     if (num_release_cells > 0) {
-        sycl::buffer<int, 1>    buf_release_indices(release_flat_indices.data(),    sycl::range<1>(num_release_cells));
-        sycl::buffer<float, 1>  buf_dem(dem_ptr,                                    sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_z_delta(host_z_delta.data(),                    sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_flux(host_flux.data(),                          sycl::range<1>(total_cells));
-        sycl::buffer<int, 1>    buf_counts(host_counts.data(),                      sycl::range<1>(total_cells));
+        sycl::buffer<int, 1>    buf_release_indices(release_flat_indices.begin(),   release_flat_indices.end());
+        sycl::buffer<float, 1>  buf_dem(dem_ptr,                                    dem_ptr + total_cells);
+        sycl::buffer<float, 1>  buf_z_delta(host_z_delta.begin(),                   host_z_delta.end());
+        sycl::buffer<float, 1>  buf_flux(host_flux.begin(),                         host_flux.end());
+        sycl::buffer<int, 1>    buf_counts(host_counts.begin(),                     host_counts.end());
         
-        sycl::buffer<float, 1>  buf_var_alpha(var_alpha_data,                       sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_var_exponent(var_exponent_data,                 sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_var_umax(var_umax_data,                         sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_infra(infra_data,                               sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_forest(forest_data,                             sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_backcalc(host_backcalc.data(),                  sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_forest_int(host_forest_int.data(),              sycl::range<1>(total_cells));
+        sycl::buffer<float, 1>  buf_var_alpha(var_alpha_data,                      var_alpha_data + total_cells);
+        sycl::buffer<float, 1>  buf_var_exponent(var_exponent_data,                var_exponent_data + total_cells);
+        sycl::buffer<float, 1>  buf_var_umax(var_umax_data,                        var_umax_data + total_cells);
+        sycl::buffer<float, 1>  buf_infra(infra_data,                              infra_data + total_cells);
+        sycl::buffer<float, 1>  buf_forest(forest_data,                            forest_data + total_cells);
+        sycl::buffer<float, 1>  buf_backcalc(host_backcalc.begin(),                 host_backcalc.end());
+        sycl::buffer<float, 1>  buf_forest_int(host_forest_int.begin(),             host_forest_int.end());
 
         q.submit([&](sycl::handler& cgh) {
             // Accessors
@@ -756,12 +756,12 @@ py::tuple run_sycl_calculation(
         q.wait_and_throw();
     } // Buffer destructors block and copy results from device back to host vector
     
-    // Convert vectors to numpy arrays
-    auto py_z_delta = py::array_t<float>(total_cells);
-    auto py_flux = py::array_t<float>(total_cells);
-    auto py_counts = py::array_t<int>(total_cells);
-    auto py_backcalc = py::array_t<float>(total_cells);
-    auto py_forest_int = py::array_t<float>(total_cells);
+    // Convert vectors to 2D numpy arrays
+    auto py_z_delta = py::array_t<float>({rows, cols});
+    auto py_flux = py::array_t<float>({rows, cols});
+    auto py_counts = py::array_t<int>({rows, cols});
+    auto py_backcalc = py::array_t<float>({rows, cols});
+    auto py_forest_int = py::array_t<float>({rows, cols});
     
     std::copy(host_z_delta.begin(), host_z_delta.end(), static_cast<float*>(py_z_delta.request().ptr));
     std::copy(host_flux.begin(), host_flux.end(), static_cast<float*>(py_flux.request().ptr));
@@ -781,13 +781,6 @@ py::tuple run_sycl_calculation(
     
     std::copy(host_backcalc.begin(), host_backcalc.end(), static_cast<float*>(py_backcalc.request().ptr));
     std::copy(host_forest_int.begin(), host_forest_int.end(), static_cast<float*>(py_forest_int.request().ptr));
-    
-    // Reshape to 2D
-    py_z_delta.resize({rows, cols});
-    py_flux.resize({rows, cols});
-    py_counts.resize({rows, cols});
-    py_backcalc.resize({rows, cols});
-    py_forest_int.resize({rows, cols});
     
     return py::make_tuple(py_z_delta, py_flux, py_counts, py_backcalc, py_forest_int);
 }
