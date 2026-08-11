@@ -10,8 +10,8 @@ namespace py = pybind11;
 
 namespace sycl_flow {
 
-#define MAX_QUEUE_SIZE 32768
-#define MAX_VISITED 32768
+#define MAX_QUEUE_SIZE 4096
+#define MAX_VISITED 4096
 
 py::tuple run_sycl_calculation(
     py::array_t<float> dem,
@@ -214,7 +214,7 @@ py::tuple run_sycl_calculation(
                 int start_col = start_flat_index % cols;
                 
                 auto is_nodata = [=](float val) {
-                    return sycl::fabs(val - nodata) < 1e-3f;
+                    return sycl::isnan(val) || sycl::fabs(val - nodata) < 1e-3f;
                 };
 
                 auto is_neighborhood_valid = [=](int r, int c) {
