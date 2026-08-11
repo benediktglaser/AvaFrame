@@ -10,8 +10,8 @@ namespace py = pybind11;
 
 namespace sycl_flow {
 
-#define MAX_QUEUE_SIZE 1024
-#define MAX_VISITED 1024
+#define MAX_QUEUE_SIZE 32768
+#define MAX_VISITED 32768
 
 py::tuple run_sycl_calculation(
     py::array_t<float> dem,

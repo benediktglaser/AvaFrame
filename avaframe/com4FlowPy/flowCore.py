@@ -234,8 +234,11 @@ def run(optTuple):
     nRel = np.sum(release)
     log.info("Number of release cells: %i" % nRel)
 
-    if HAS_SYCL:
+    target = os.environ.get("ACPP_TARGETS", "").lower()
+    if HAS_SYCL and target != "python":
         log.info("Running calculation with C++/SYCL core.")
+        device_type = "gpu" if "gpu" in target else "cpu"
+
         zDeltaArray, fluxArray, countArray, backcalc, forestIntArray = sycl_core.run_sycl_calculation(
             dem,
             release,
@@ -253,7 +256,7 @@ def run(optTuple):
             previewMode,
             forestArray,
             forestParams,
-            "cpu"
+            device_type
         )
         
         # initializing arrays for storing the results
