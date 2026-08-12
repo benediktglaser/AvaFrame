@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
+import os
 import sys
 import numpy as np
 import avaframe.com4FlowPy.sycl.sycl_core as sycl_core
 import avaframe.com4FlowPy.flowCore as flowCore
+
+device_type = os.environ.get("ACPP_TARGETS", sys.argv[1] if len(sys.argv) > 1 else "cpu").lower()
+device_type = "gpu" if ("gpu" in device_type or "cuda" in device_type) else "cpu"
+print(f"Running unit tests on device target: '{device_type}'")
 
 # DEM with merging paths (diagonal slope)
 dem = np.zeros((5, 5), dtype=np.float32)
@@ -40,7 +45,7 @@ def compare_results(name, sycl_res, py_res, tol=1e-5):
 print("\n--- RUNNING TEST 1: Base Correctness ---")
 z_sycl, f_sycl, c_sycl, b_sycl, fo_sycl = sycl_core.run_sycl_calculation(
     dem, rel, None, 30.0, 3.0, 3e-4, 270.0, -9999.0, 10.0,
-    False, False, varParams, False, False, None, None, "cpu"
+    False, False, varParams, False, False, None, None, device_type
 )
 
 outputs = ['zDelta', 'flux', 'cellCounts']
@@ -68,7 +73,7 @@ infra[4, 2] = 2.0
 
 z_sycl, f_sycl, c_sycl, b_sycl, fo_sycl = sycl_core.run_sycl_calculation(
     dem, rel, infra, 30.0, 3.0, 3e-4, 270.0, -9999.0, 10.0,
-    True, False, varParams, False, False, None, None, "cpu"
+    True, False, varParams, False, False, None, None, device_type
 )
 
 args[1] = infra
@@ -107,7 +112,7 @@ forestParams = {
 
 z_sycl, f_sycl, c_sycl, b_sycl, fo_sycl = sycl_core.run_sycl_calculation(
     dem, rel, None, 30.0, 3.0, 3e-4, 270.0, -9999.0, 10.0,
-    False, True, varParams, False, False, forestArray, forestParams, "cpu"
+    False, True, varParams, False, False, forestArray, forestParams, device_type
 )
 
 args[1] = None
