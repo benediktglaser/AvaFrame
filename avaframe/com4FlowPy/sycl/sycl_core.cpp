@@ -157,7 +157,18 @@ py::tuple run_sycl_calculation(
         dev = sycl::device(sycl::default_selector_v);
     }
     
-    sycl::queue q(dev);
+    // Asynchronous exception handler to convert GPU kernel errors to Python exceptions
+    auto async_handler = [](sycl::exception_list e_list) {
+        for (auto& e : e_list) {
+            try {
+                std::rethrow_exception(e);
+            } catch (const sycl::exception& se) {
+                throw std::runtime_error(std::string("SYCL GPU Kernel Failure: ") + se.what());
+            }
+        }
+    };
+    
+    sycl::queue q(dev, async_handler);
     std::cout << "Running on device: " << q.get_device().get_info<sycl::info::device::name>() << std::endl;
     
     // Buffer vectors
