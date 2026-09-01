@@ -10,8 +10,8 @@ namespace py = pybind11;
 
 namespace sycl_flow {
 
-#define MAX_QUEUE_SIZE 4096
-#define MAX_VISITED 4096
+#define MAX_QUEUE_SIZE 32768
+#define MAX_VISITED 32768
 
 py::tuple run_sycl_calculation(
     py::array_t<float> dem,
@@ -168,17 +168,17 @@ py::tuple run_sycl_calculation(
         }
     };
     
-    sycl::queue q(dev, async_handler);
+    sycl::queue q(dev, async_handler, sycl::property_list{sycl::property::queue::in_order{}});
     std::cout << "Running on device: " << q.get_device().get_info<sycl::info::device::name>() << std::endl;
     
-    // Buffer vectors
+    // Host result vectors
     std::vector<float> host_z_delta(total_cells, 0.0f);
     std::vector<float> host_flux(total_cells, -9999.0f);
     std::vector<int> host_counts(total_cells, 0);
     std::vector<float> host_backcalc(total_cells, -9999.0f);
     std::vector<float> host_forest_int(total_cells, 999999.0f);
     
-    // Dummy buffers to prevent SYCL crash on nullptr
+    // Dummy buffers to prevent crash on nullptr
     std::vector<float> dummy(total_cells, 0.0f);
     
     float* var_alpha_data = varAlpha_ptr ? varAlpha_ptr : dummy.data();
@@ -188,37 +188,35 @@ py::tuple run_sycl_calculation(
     float* forest_data = forest_ptr ? forest_ptr : dummy.data();
 
     if (num_release_cells > 0) {
-        sycl::buffer<int, 1>    buf_release_indices(release_flat_indices.data(),    sycl::range<1>(num_release_cells));
-        sycl::buffer<float, 1>  buf_dem(dem_ptr,                                    sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_z_delta(host_z_delta.data(),                    sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_flux(host_flux.data(),                          sycl::range<1>(total_cells));
-        sycl::buffer<int, 1>    buf_counts(host_counts.data(),                      sycl::range<1>(total_cells));
-        
-        sycl::buffer<float, 1>  buf_var_alpha(var_alpha_data,                       sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_var_exponent(var_exponent_data,                 sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_var_umax(var_umax_data,                         sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_infra(infra_data,                               sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_forest(forest_data,                             sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_backcalc(host_backcalc.data(),                  sycl::range<1>(total_cells));
-        sycl::buffer<float, 1>  buf_forest_int(host_forest_int.data(),              sycl::range<1>(total_cells));
+        int* rel_indices = sycl::malloc_device<int>(num_release_cells, q);
+        float* dem = sycl::malloc_device<float>(total_cells, q);
+        float* z_delta = sycl::malloc_device<float>(total_cells, q);
+        float* flux = sycl::malloc_device<float>(total_cells, q);
+        int* counts = sycl::malloc_device<int>(total_cells, q);
 
-        q.submit([&](sycl::handler& cgh) {
-            // Accessors
-            auto dem = buf_dem.get_access<sycl::access::mode::read>(cgh);
-            auto rel_indices = buf_release_indices.get_access<sycl::access::mode::read>(cgh);
-            auto z_delta = buf_z_delta.get_access<sycl::access::mode::read_write>(cgh);
-            auto flux = buf_flux.get_access<sycl::access::mode::read_write>(cgh);
-            auto counts = buf_counts.get_access<sycl::access::mode::read_write>(cgh);
+        float* var_alpha = sycl::malloc_device<float>(total_cells, q);
+        float* var_exponent = sycl::malloc_device<float>(total_cells, q);
+        float* var_umax = sycl::malloc_device<float>(total_cells, q);
+        float* infra_map = sycl::malloc_device<float>(total_cells, q);
+        float* forest_map = sycl::malloc_device<float>(total_cells, q);
+        float* backcalc = sycl::malloc_device<float>(total_cells, q);
+        float* forest_int = sycl::malloc_device<float>(total_cells, q);
 
-            auto var_alpha = buf_var_alpha.get_access<sycl::access::mode::read>(cgh);
-            auto var_exponent = buf_var_exponent.get_access<sycl::access::mode::read>(cgh);
-            auto var_umax = buf_var_umax.get_access<sycl::access::mode::read>(cgh);
-            auto infra_map = buf_infra.get_access<sycl::access::mode::read>(cgh);
-            auto forest_map = buf_forest.get_access<sycl::access::mode::read>(cgh);
-            auto backcalc = buf_backcalc.get_access<sycl::access::mode::read_write>(cgh);
-            auto forest_int = buf_forest_int.get_access<sycl::access::mode::read_write>(cgh);
+        // Host to Device copies
+        q.memcpy(rel_indices, release_flat_indices.data(), num_release_cells * sizeof(int));
+        q.memcpy(dem, dem_ptr, total_cells * sizeof(float));
+        q.memcpy(z_delta, host_z_delta.data(), total_cells * sizeof(float));
+        q.memcpy(flux, host_flux.data(), total_cells * sizeof(float));
+        q.memcpy(counts, host_counts.data(), total_cells * sizeof(int));
+        q.memcpy(var_alpha, var_alpha_data, total_cells * sizeof(float));
+        q.memcpy(var_exponent, var_exponent_data, total_cells * sizeof(float));
+        q.memcpy(var_umax, var_umax_data, total_cells * sizeof(float));
+        q.memcpy(infra_map, infra_data, total_cells * sizeof(float));
+        q.memcpy(forest_map, forest_data, total_cells * sizeof(float));
+        q.memcpy(backcalc, host_backcalc.data(), total_cells * sizeof(float));
+        q.memcpy(forest_int, host_forest_int.data(), total_cells * sizeof(float));
 
-            cgh.parallel_for(sycl::range<1>(num_release_cells), [=](sycl::id<1> idx) {
+        q.parallel_for(sycl::range<1>(num_release_cells), [=](sycl::id<1> idx) {
                 int thread_id = idx[0];
                 int start_flat_index = rel_indices[thread_id];
                 int start_row = start_flat_index / cols;
@@ -766,10 +764,30 @@ py::tuple run_sycl_calculation(
                     }
                 }
             });
-        });
         
+        // Device to Host memory copies
+        q.memcpy(host_z_delta.data(), z_delta, total_cells * sizeof(float));
+        q.memcpy(host_flux.data(), flux, total_cells * sizeof(float));
+        q.memcpy(host_counts.data(), counts, total_cells * sizeof(int));
+        q.memcpy(host_backcalc.data(), backcalc, total_cells * sizeof(float));
+        q.memcpy(host_forest_int.data(), forest_int, total_cells * sizeof(float));
+
         q.wait_and_throw();
-    } // Buffer destructors block and copy results from device back to host vector
+
+        // Free device allocations
+        sycl::free(rel_indices, q);
+        sycl::free(dem, q);
+        sycl::free(z_delta, q);
+        sycl::free(flux, q);
+        sycl::free(counts, q);
+        sycl::free(var_alpha, q);
+        sycl::free(var_exponent, q);
+        sycl::free(var_umax, q);
+        sycl::free(infra_map, q);
+        sycl::free(forest_map, q);
+        sycl::free(backcalc, q);
+        sycl::free(forest_int, q);
+    }
     
     // Convert vectors to 2D numpy arrays
     auto py_z_delta = py::array_t<float>({rows, cols});
