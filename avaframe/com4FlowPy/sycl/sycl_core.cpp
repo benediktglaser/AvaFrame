@@ -246,11 +246,16 @@ py::tuple run_sycl_calculation(
         float* backcalc = sycl::malloc_device<float>(total_cells, q);
         float* forest_int = sycl::malloc_device<float>(total_cells, q);
 
-        // Allocate Device Work Pool in USM global device memory (bounded by MAX_CONCURRENT_PATHS)
-        size_t max_concurrent = std::min<size_t>(static_cast<size_t>(num_release_cells), MAX_CONCURRENT_PATHS);
-        size_t total_pool_nodes = max_concurrent * CAPACITY_PER_PATH;
+        // Allocate Device Work Pool for fixed pool of persistent workers
+        size_t num_workers = std::min<size_t>(static_cast<size_t>(num_release_cells), MAX_CONCURRENT_PATHS);
+        size_t total_pool_nodes = num_workers * CAPACITY_PER_PATH;
         PathNode* d_work_pool = sycl::malloc_device<PathNode>(total_pool_nodes, q);
         float* d_infra_pool = infraBool ? sycl::malloc_device<float>(total_pool_nodes, q) : nullptr;
+
+        // Global Atomic Task Counter for Dynamic Work-Stealing
+        int* d_task_counter = sycl::malloc_device<int>(1, q);
+        int init_counter = 0;
+        q.memcpy(d_task_counter, &init_counter, sizeof(int));
 
         // Host to Device copies
         q.memcpy(rel_indices, release_flat_indices.data(), num_release_cells * sizeof(int));
@@ -266,15 +271,15 @@ py::tuple run_sycl_calculation(
         q.memcpy(backcalc, host_backcalc.data(), total_cells * sizeof(float));
         q.memcpy(forest_int, host_forest_int.data(), total_cells * sizeof(float));
 
-        for (int batch_start = 0; batch_start < num_release_cells; batch_start += MAX_CONCURRENT_PATHS) {
-            int current_batch_size = std::min<int>(MAX_CONCURRENT_PATHS, num_release_cells - batch_start);
-            q.parallel_for(sycl::range<1>(current_batch_size), [=](sycl::id<1> idx) {
-                int thread_id = idx[0];
-                int global_rel_id = batch_start + thread_id;
-                int start_flat_index = rel_indices[global_rel_id];
-                int start_row = start_flat_index / cols;
-                int start_col = start_flat_index % cols;
-            
+        // Launch single persistent kernel over num_workers
+        q.parallel_for(sycl::range<1>(num_workers), [=](sycl::id<1> idx) {
+            int worker_id = idx[0];
+            PathNode* queue = &d_work_pool[static_cast<size_t>(worker_id) * CAPACITY_PER_PATH];
+            float* node_infra = d_infra_pool ? &d_infra_pool[static_cast<size_t>(worker_id) * CAPACITY_PER_PATH] : nullptr;
+
+            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
+                task_counter(*d_task_counter);
+
             auto is_nodata = [=](float val) {
                 return sycl::isnan(val) || sycl::fabs(val - nodata) < 1e-3f;
             };
@@ -294,30 +299,38 @@ py::tuple run_sycl_calculation(
                 return true;
             };
 
-            // Validate start cell neighborhood
-            if (!is_neighborhood_valid(start_row, start_col)) {
-                return;
-            }
-            
-            float thread_max_z_delta = max_z_delta;
-            float thread_alpha = alpha;
-            int thread_exp = static_cast<int>(exp);
+            while (true) {
+                int my_task_id = task_counter.fetch_add(1);
+                if (my_task_id >= num_release_cells) {
+                    break;
+                }
 
-            if (varUmaxBool && var_umax[start_flat_index] > 0.0f && var_umax[start_flat_index] <= 8848.0f) {
-                thread_max_z_delta = var_umax[start_flat_index];
-            }
-            if (varAlphaBool && var_alpha[start_flat_index] > 0.0f && var_alpha[start_flat_index] <= 90.0f) {
-                thread_alpha = var_alpha[start_flat_index];
-            }
-            if (varExponentBool && var_exponent[start_flat_index] > 0.0f) {
-                thread_exp = static_cast<int>(var_exponent[start_flat_index]);
-            }
-            
-            float tanAlpha = sycl::tan(thread_alpha * 3.141592653589793f / 180.0f);
+                int start_flat_index = rel_indices[my_task_id];
+                int start_row = start_flat_index / cols;
+                int start_col = start_flat_index % cols;
 
-            // Per-thread slice in USM device work pool
-            PathNode* queue = &d_work_pool[static_cast<size_t>(thread_id) * CAPACITY_PER_PATH];
-            int queue_size = 0;
+                // Validate start cell neighborhood
+                if (!is_neighborhood_valid(start_row, start_col)) {
+                    continue;
+                }
+                
+                float thread_max_z_delta = max_z_delta;
+                float thread_alpha = alpha;
+                int thread_exp = static_cast<int>(exp);
+
+                if (varUmaxBool && var_umax[start_flat_index] > 0.0f && var_umax[start_flat_index] <= 8848.0f) {
+                    thread_max_z_delta = var_umax[start_flat_index];
+                }
+                if (varAlphaBool && var_alpha[start_flat_index] > 0.0f && var_alpha[start_flat_index] <= 90.0f) {
+                    thread_alpha = var_alpha[start_flat_index];
+                }
+                if (varExponentBool && var_exponent[start_flat_index] > 0.0f) {
+                    thread_exp = static_cast<int>(var_exponent[start_flat_index]);
+                }
+                
+                float tanAlpha = sycl::tan(thread_alpha * 3.141592653589793f / 180.0f);
+
+                int queue_size = 0;
 
             PathNode start_node;
             start_node.r = start_row;
@@ -763,8 +776,7 @@ py::tuple run_sycl_calculation(
             }
 
             // Backtracking for Infrastructure
-            if (infraBool && d_infra_pool != nullptr) {
-                float* node_infra = &d_infra_pool[static_cast<size_t>(thread_id) * CAPACITY_PER_PATH];
+            if (infraBool && node_infra != nullptr) {
                 for (int i = 0; i < queue_size; i++) {
                     float infra_val = infra_map[queue[i].r * cols + queue[i].c];
                     node_infra[i] = sycl::max(0.0f, infra_val);
@@ -791,10 +803,10 @@ py::tuple run_sycl_calculation(
                     atomic_min_float(&forest_int[flat_idx], static_cast<float>(queue[i].forest_int_count));
                 }
             }
+            } // end while (true) work-stealing loop
         });
         q.wait_and_throw();
-    }
-    
+
         // Device to Host memory copies
         q.memcpy(host_z_delta.data(), z_delta, total_cells * sizeof(float));
         q.memcpy(host_flux.data(), flux, total_cells * sizeof(float));
@@ -818,6 +830,7 @@ py::tuple run_sycl_calculation(
         sycl::free(backcalc, q);
         sycl::free(forest_int, q);
         sycl::free(d_work_pool, q);
+        sycl::free(d_task_counter, q);
         if (d_infra_pool) sycl::free(d_infra_pool, q);
     }
     
