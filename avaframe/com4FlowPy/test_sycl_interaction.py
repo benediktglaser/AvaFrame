@@ -6,7 +6,7 @@ import avaframe.com4FlowPy.sycl.sycl_core as sycl_core
 import avaframe.com4FlowPy.flowCore as flowCore
 
 device_type = os.environ.get("ACPP_TARGETS", sys.argv[1] if len(sys.argv) > 1 else "cpu").lower()
-device_type = "gpu" if ("gpu" in device_type or "cuda" in device_type) else "cpu"
+device_type = "gpu" if any(x in device_type for x in ["gpu", "cuda", "hip", "rocm", "gfx"]) else "cpu"
 print(f"Running unit tests on device target: '{device_type}'")
 
 # DEM with merging paths (diagonal slope)

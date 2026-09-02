@@ -237,7 +237,7 @@ def run(optTuple):
     target = os.environ.get("ACPP_TARGETS", "").lower()
     if HAS_SYCL and target != "python":
         log.info("Running calculation with C++/SYCL core.")
-        device_type = "gpu" if "gpu" in target else "cpu"
+        device_type = "gpu" if any(x in target for x in ["gpu", "cuda", "hip", "rocm", "gfx"]) else "cpu"
 
         # Explicitly ensure C-contiguous float32 arrays before passing to C++
         dem_f32 = np.ascontiguousarray(dem, dtype=np.float32)

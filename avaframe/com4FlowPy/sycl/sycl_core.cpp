@@ -10,8 +10,23 @@ namespace py = pybind11;
 
 namespace sycl_flow {
 
-#define MAX_QUEUE_SIZE 32768
-#define MAX_VISITED 32768
+#define CAPACITY_PER_PATH 32768
+
+struct PathNode {
+    int r;
+    int c;
+    float flux;
+    float z_delta;
+    float parent_z_deltas[3][3];
+    bool is_start;
+    bool parent_is_start;
+    int parent_indices[8];
+    int num_parents;
+    float min_distance;
+    float minDistXYZ;
+    int isForest;
+    int forest_int_count;
+};
 
 py::tuple run_sycl_calculation(
     py::array_t<float> dem,
@@ -202,6 +217,11 @@ py::tuple run_sycl_calculation(
         float* backcalc = sycl::malloc_device<float>(total_cells, q);
         float* forest_int = sycl::malloc_device<float>(total_cells, q);
 
+        // Allocate Device Work Pool in USM global device memory
+        size_t total_pool_nodes = static_cast<size_t>(num_release_cells) * CAPACITY_PER_PATH;
+        PathNode* d_work_pool = sycl::malloc_device<PathNode>(total_pool_nodes, q);
+        float* d_infra_pool = infraBool ? sycl::malloc_device<float>(total_pool_nodes, q) : nullptr;
+
         // Host to Device copies
         q.memcpy(rel_indices, release_flat_indices.data(), num_release_cells * sizeof(int));
         q.memcpy(dem, dem_ptr, total_cells * sizeof(float));
@@ -217,554 +237,538 @@ py::tuple run_sycl_calculation(
         q.memcpy(forest_int, host_forest_int.data(), total_cells * sizeof(float));
 
         q.parallel_for(sycl::range<1>(num_release_cells), [=](sycl::id<1> idx) {
-                int thread_id = idx[0];
-                int start_flat_index = rel_indices[thread_id];
-                int start_row = start_flat_index / cols;
-                int start_col = start_flat_index % cols;
-                
-                auto is_nodata = [=](float val) {
-                    return sycl::isnan(val) || sycl::fabs(val - nodata) < 1e-3f;
-                };
+            int thread_id = idx[0];
+            int start_flat_index = rel_indices[thread_id];
+            int start_row = start_flat_index / cols;
+            int start_col = start_flat_index % cols;
+            
+            auto is_nodata = [=](float val) {
+                return sycl::isnan(val) || sycl::fabs(val - nodata) < 1e-3f;
+            };
 
-                auto is_neighborhood_valid = [=](int r, int c) {
-                    if (r - 1 < 0 || r + 1 >= rows || c - 1 < 0 || c + 1 >= cols) {
-                        return false;
+            auto is_neighborhood_valid = [=](int r, int c) {
+                if (r - 1 < 0 || r + 1 >= rows || c - 1 < 0 || c + 1 >= cols) {
+                    return false;
+                }
+                for (int dr = -1; dr <= 1; dr++) {
+                    for (int dc = -1; dc <= 1; dc++) {
+                        float val = dem[(r + dr) * cols + (c + dc)];
+                        if (is_nodata(val)) {
+                            return false;
+                        }
                     }
+                }
+                return true;
+            };
+
+            // Validate start cell neighborhood
+            if (!is_neighborhood_valid(start_row, start_col)) {
+                return;
+            }
+            
+            float thread_max_z_delta = max_z_delta;
+            float thread_alpha = alpha;
+            int thread_exp = static_cast<int>(exp);
+
+            if (varUmaxBool && var_umax[start_flat_index] > 0.0f && var_umax[start_flat_index] <= 8848.0f) {
+                thread_max_z_delta = var_umax[start_flat_index];
+            }
+            if (varAlphaBool && var_alpha[start_flat_index] > 0.0f && var_alpha[start_flat_index] <= 90.0f) {
+                thread_alpha = var_alpha[start_flat_index];
+            }
+            if (varExponentBool && var_exponent[start_flat_index] > 0.0f) {
+                thread_exp = static_cast<int>(var_exponent[start_flat_index]);
+            }
+            
+            float tanAlpha = sycl::tan(thread_alpha * 3.141592653589793f / 180.0f);
+
+            // Per-thread slice in USM device work pool
+            PathNode* queue = &d_work_pool[static_cast<size_t>(thread_id) * CAPACITY_PER_PATH];
+            int queue_size = 0;
+
+            PathNode start_node;
+            start_node.r = start_row;
+            start_node.c = start_col;
+            start_node.flux = 1.0f;
+            start_node.z_delta = 0.0f;
+            for (int r = 0; r < 3; r++) {
+                for (int c = 0; c < 3; c++) {
+                    start_node.parent_z_deltas[r][c] = 0.0f;
+                }
+            }
+            start_node.is_start = true;
+            start_node.parent_is_start = false;
+            start_node.num_parents = 0;
+            start_node.min_distance = 0.0f;
+            start_node.minDistXYZ = 0.0f;
+            start_node.isForest = (forestBool && forestInteraction && forest_map[start_flat_index] > 0.0f) ? 1 : 0;
+            start_node.forest_int_count = start_node.isForest;
+            
+            queue[queue_size++] = start_node;
+
+            int q_idx = 0;
+            while (q_idx < queue_size) {
+                PathNode curr = queue[q_idx++];
+                int curr_flat = curr.r * cols + curr.c;
+                
+                // Calc z_delta_neighbour
+                float altitude = dem[curr_flat];
+                float z_delta_neighbour[3][3] = {0.0f};
+                
+                constexpr float RAD90 = 1.57079632679f;
+                constexpr float SQRT2 = 1.41421356237f;
+                
+                // Forest friction influence on tanAlpha
+                float thread_tanAlpha = tanAlpha;
+                if (forestBool) {
+                    if (forest_module_enum == 3) { // forestFrictionLayer
+                        if (!curr.is_start && skipForestDist < curr.minDistXYZ) {
+                            float FSI_val = forest_map[curr_flat];
+                            float AlphaFor = 0.0f;
+                            if (friction_layer_type_enum == 0) {
+                                AlphaFor = FSI_val;
+                            } else {
+                                AlphaFor = thread_alpha + FSI_val;
+                            }
+                            if (AlphaFor < thread_alpha) AlphaFor = thread_alpha;
+                            thread_tanAlpha = sycl::tan(AlphaFor * 3.141592653589793f / 180.0f);
+                        }
+                    } else if (forest_module_enum == 1 || forest_module_enum == 2) { // forestFriction / forestDetrainment
+                        float FSI_val = forest_map[curr_flat];
+                        if (!curr.is_start && FSI_val > 0.0f && skipForestDist < curr.minDistXYZ) {
+                            float friction = minAddedFrictionFor;
+                            if (curr.z_delta < noFrictionEffectZDelta) {
+                                float rest = maxAddedFrictionFor * FSI_val;
+                                float slope = (rest - minAddedFrictionFor) / (0.0f - noFrictionEffectZDelta);
+                                friction = sycl::max(minAddedFrictionFor, slope * curr.z_delta + rest);
+                            }
+                            float alpha_calc = thread_alpha + sycl::max(0.0f, friction);
+                            thread_tanAlpha = sycl::tan(alpha_calc * 3.141592653589793f / 180.0f);
+                        }
+                    }
+                }
+
+                for (int dr = -1; dr <= 1; dr++) {
+                    for (int dc = -1; dc <= 1; dc++) {
+                        int r_idx = dr + 1;
+                        int c_idx = dc + 1;
+                        
+                        float ds = (dr != 0 && dc != 0) ? SQRT2 : 1.0f;
+                        if (dr == 0 && dc == 0) ds = 0.0f;
+                        
+                        float dem_val = dem[(curr.r + dr) * cols + (curr.c + dc)];
+                        float z_gamma = altitude - dem_val;
+                        float z_alpha = ds * cellsize * thread_tanAlpha;
+                        
+                        float zd_neigh = curr.z_delta + z_gamma - z_alpha;
+                        if (zd_neigh < 0.0f) zd_neigh = 0.0f;
+                        if (zd_neigh > thread_max_z_delta) zd_neigh = thread_max_z_delta;
+                        
+                        z_delta_neighbour[r_idx][c_idx] = zd_neigh;
+                    }
+                }
+                
+                // Calc persistence
+                float persistence[3][3] = {0.0f};
+                float no_flow[3][3] = {
+                    {1.0f, 1.0f, 1.0f},
+                    {1.0f, 1.0f, 1.0f},
+                    {1.0f, 1.0f, 1.0f}
+                };
+                
+                if (curr.is_start || curr.parent_is_start) {
+                    for (int r = 0; r < 3; r++) {
+                        for (int c = 0; c < 3; c++) {
+                            persistence[r][c] = 1.0f;
+                        }
+                    }
+                } else {
                     for (int dr = -1; dr <= 1; dr++) {
                         for (int dc = -1; dc <= 1; dc++) {
-                            float val = dem[(r + dr) * cols + (c + dc)];
-                            if (is_nodata(val)) {
-                                return false;
+                            float maxweight = curr.parent_z_deltas[dr + 1][dc + 1];
+                            if (maxweight > 0.0f) {
+                                no_flow[dr + 1][dc + 1] = 0.0f;
+                                int dx = dc;
+                                int dy = dr;
+                                
+                                if (dx == -1) {
+                                    if (dy == -1) {
+                                        persistence[2][2] += maxweight;
+                                        persistence[2][1] += 0.707f * maxweight;
+                                        persistence[1][2] += 0.707f * maxweight;
+                                    } else if (dy == 0) {
+                                        persistence[1][2] += maxweight;
+                                        persistence[2][2] += 0.707f * maxweight;
+                                        persistence[0][2] += 0.707f * maxweight;
+                                    } else if (dy == 1) {
+                                        persistence[0][2] += maxweight;
+                                        persistence[0][1] += 0.707f * maxweight;
+                                        persistence[1][2] += 0.707f * maxweight;
+                                    }
+                                } else if (dx == 0) {
+                                    if (dy == -1) {
+                                        persistence[2][1] += maxweight;
+                                        persistence[2][0] += 0.707f * maxweight;
+                                        persistence[2][2] += 0.707f * maxweight;
+                                    } else if (dy == 1) {
+                                        persistence[0][1] += maxweight;
+                                        persistence[0][0] += 0.707f * maxweight;
+                                        persistence[0][2] += 0.707f * maxweight;
+                                    }
+                                } else if (dx == 1) {
+                                    if (dy == -1) {
+                                        persistence[2][0] += maxweight;
+                                        persistence[1][0] += 0.707f * maxweight;
+                                        persistence[2][1] += 0.707f * maxweight;
+                                    } else if (dy == 0) {
+                                        persistence[1][0] += maxweight;
+                                        persistence[0][0] += 0.707f * maxweight;
+                                        persistence[2][0] += 0.707f * maxweight;
+                                    } else if (dy == 1) {
+                                        persistence[0][0] += maxweight;
+                                        persistence[0][1] += 0.707f * maxweight;
+                                        persistence[1][0] += 0.707f * maxweight;
+                                    }
+                                }
                             }
                         }
                     }
-                    return true;
-                };
-
-                // Validate start cell neighborhood
-                if (!is_neighborhood_valid(start_row, start_col)) {
-                    return;
                 }
                 
-                float thread_max_z_delta = max_z_delta;
-                float thread_alpha = alpha;
-                int thread_exp = static_cast<int>(exp);
-
-                if (varUmaxBool && var_umax[start_flat_index] > 0.0f && var_umax[start_flat_index] <= 8848.0f) {
-                    thread_max_z_delta = var_umax[start_flat_index];
-                }
-                if (varAlphaBool && var_alpha[start_flat_index] > 0.0f && var_alpha[start_flat_index] <= 90.0f) {
-                    thread_alpha = var_alpha[start_flat_index];
-                }
-                if (varExponentBool && var_exponent[start_flat_index] > 0.0f) {
-                    thread_exp = static_cast<int>(var_exponent[start_flat_index]);
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        persistence[r][c] *= no_flow[r][c];
+                    }
                 }
                 
-                float tanAlpha = sycl::tan(thread_alpha * 3.141592653589793f / 180.0f);
+                // Calc tan_beta
+                float tan_beta[3][3] = {0.0f};
+                float r_t[3][3] = {0.0f};
+                float sum_rt = 0.0f;
+                
+                for (int dr = -1; dr <= 1; dr++) {
+                    for (int dc = -1; dc <= 1; dc++) {
+                        if (dr == 0 && dc == 0) {
+                            continue;
+                        }
+                        int r_idx = dr + 1;
+                        int c_idx = dc + 1;
+                        
+                        if (z_delta_neighbour[r_idx][c_idx] <= 0.0f || persistence[r_idx][c_idx] <= 0.0f) {
+                            continue;
+                        }
+                        
+                        float ds = (dr != 0 && dc != 0) ? SQRT2 : 1.0f;
+                        float distance = ds * cellsize;
+                        float dem_val = dem[(curr.r + dr) * cols + (curr.c + dc)];
+                        float slope_term = (altitude - dem_val) / distance;
+                        float beta = sycl::atan(slope_term) + RAD90;
+                        float tb = sycl::tan(beta / 2.0f);
+                        
+                        tan_beta[r_idx][c_idx] = tb;
+                        float rt_val = sycl::pow(tb, static_cast<float>(thread_exp));
+                        r_t[r_idx][c_idx] = rt_val;
+                        sum_rt += rt_val;
+                    }
+                }
+                
+                if (sum_rt > 0.0f) {
+                    for (int r = 0; r < 3; r++) {
+                        for (int c = 0; c < 3; c++) {
+                            r_t[r][c] /= sum_rt;
+                        }
+                    }
+                }
+                
+                // Calc detrainment and adjust current flux
+                float current_flux = curr.flux;
+                if (forestBool && forestDetrainmentBool && !curr.is_start) {
+                    float FSI_val = forest_map[curr_flat];
+                    float rest = maxDetrainmentFor * FSI_val;
+                    float slope = 0.0f;
+                    if (noDetrainmentEffectZdelta != 0.0f) {
+                        slope = (rest - minDetrainmentFor) / (0.0f - noDetrainmentEffectZdelta);
+                    }
+                    float detrainment = sycl::max(minDetrainmentFor, slope * curr.z_delta + rest);
+                    current_flux = sycl::max(0.0003f, current_flux - detrainment);
+                }
 
-                struct PathNode {
+                // Calc dist
+                float dist[3][3] = {0.0f};
+                float sum_p_rt = 0.0f;
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        dist[r][c] = persistence[r][c] * r_t[r][c];
+                        sum_p_rt += dist[r][c];
+                    }
+                }
+                
+                if (sum_p_rt > 0.0f) {
+                    for (int r = 0; r < 3; r++) {
+                        for (int c = 0; c < 3; c++) {
+                            dist[r][c] = (dist[r][c] / sum_p_rt) * current_flux;
+                        }
+                    }
+                }
+                
+                // Redistribute flux below threshold
+                int count = 0;
+                float mass_to_distribute = 0.0f;
+                
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        float d_val = dist[r][c];
+                        if (fluxDistOldVersionBool) {
+                            if (d_val > 0.0f && d_val < flux_threshold) {
+                                count++;
+                            }
+                        } else {
+                            if (d_val >= flux_threshold) {
+                                count++;
+                            }
+                        }
+                        if (d_val < flux_threshold) {
+                            mass_to_distribute += d_val;
+                        }
+                    }
+                }
+                
+                if (mass_to_distribute > 0.0f && count > 0) {
+                    for (int r = 0; r < 3; r++) {
+                        for (int c = 0; c < 3; c++) {
+                            if (dist[r][c] >= flux_threshold) {
+                                dist[r][c] += mass_to_distribute / static_cast<float>(count);
+                            } else {
+                                dist[r][c] = 0.0f;
+                            }
+                        }
+                    }
+                }
+                
+                float sum_dist = 0.0f;
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        sum_dist += dist[r][c];
+                    }
+                }
+                
+                if (sum_dist != current_flux && count > 0) {
+                    float diff = (current_flux - sum_dist) / static_cast<float>(count);
+                    for (int r = 0; r < 3; r++) {
+                        for (int c = 0; c < 3; c++) {
+                            if (dist[r][c] >= flux_threshold) {
+                                dist[r][c] += diff;
+                            }
+                        }
+                    }
+                }
+                
+                // Distribute to valid neighbors
+                struct NeighborNode {
                     int r;
                     int c;
                     float flux;
                     float z_delta;
-                    float parent_z_deltas[3][3];
-                    bool is_start;
-                    bool parent_is_start;
-                    int parent_indices[8];
-                    int num_parents;
-                    float min_distance;
-                    float minDistXYZ;
-                    int isForest;
-                    int forest_int_count;
                 };
+                NeighborNode valid_neighbors[8];
+                int num_valid = 0;
 
-                PathNode queue[MAX_QUEUE_SIZE];
-                int queue_size = 0;
-
-                PathNode start_node;
-                start_node.r = start_row;
-                start_node.c = start_col;
-                start_node.flux = 1.0f;
-                start_node.z_delta = 0.0f;
-                for (int r = 0; r < 3; r++) {
-                    for (int c = 0; c < 3; c++) {
-                        start_node.parent_z_deltas[r][c] = 0.0f;
+                for (int dr = -1; dr <= 1; dr++) {
+                    for (int dc = -1; dc <= 1; dc++) {
+                        if (dr == 0 && dc == 0) {
+                            continue;
+                        }
+                        int r_idx = dr + 1;
+                        int c_idx = dc + 1;
+                        float dist_val = dist[r_idx][c_idx];
+                        if (dist_val >= flux_threshold) {
+                            int nr = curr.r + dr;
+                            int nc = curr.c + dc;
+                            if (is_neighborhood_valid(nr, nc)) {
+                                float z_delta_neigh_val = z_delta_neighbour[r_idx][c_idx];
+                                valid_neighbors[num_valid++] = NeighborNode{nr, nc, dist_val, z_delta_neigh_val};
+                            }
+                        }
                     }
                 }
-                start_node.is_start = true;
-                start_node.parent_is_start = false;
-                start_node.num_parents = 0;
-                start_node.min_distance = 0.0f;
-                start_node.minDistXYZ = 0.0f;
-                start_node.isForest = (forestBool && forestInteraction && forest_map[start_flat_index] > 0.0f) ? 1 : 0;
-                start_node.forest_int_count = start_node.isForest;
-                
-                queue[queue_size++] = start_node;
 
-                int q_idx = 0;
-                while (q_idx < queue_size) {
-                    PathNode curr = queue[q_idx++];
-                    int curr_flat = curr.r * cols + curr.c;
-                    
-                    // Calc z_delta_neighbour
-                    float altitude = dem[curr_flat];
-                    float z_delta_neighbour[3][3] = {0.0f};
-                    
-                    constexpr float RAD90 = 1.57079632679f;
-                    constexpr float SQRT2 = 1.41421356237f;
-                    
-                    // Forest friction influence on tanAlpha
-                    float thread_tanAlpha = tanAlpha;
-                    if (forestBool) {
-                        if (forest_module_enum == 3) { // forestFrictionLayer
-                            if (!curr.is_start && skipForestDist < curr.minDistXYZ) {
-                                float FSI_val = forest_map[curr_flat];
-                                float AlphaFor = 0.0f;
-                                if (friction_layer_type_enum == 0) {
-                                    AlphaFor = FSI_val;
-                                } else {
-                                    AlphaFor = thread_alpha + FSI_val;
-                                }
-                                if (AlphaFor < thread_alpha) AlphaFor = thread_alpha;
-                                thread_tanAlpha = sycl::tan(AlphaFor * 3.141592653589793f / 180.0f);
-                            }
-                        } else if (forest_module_enum == 1 || forest_module_enum == 2) { // forestFriction / forestDetrainment
-                            float FSI_val = forest_map[curr_flat];
-                            if (!curr.is_start && FSI_val > 0.0f && skipForestDist < curr.minDistXYZ) {
-                                float friction = minAddedFrictionFor;
-                                if (curr.z_delta < noFrictionEffectZDelta) {
-                                    float rest = maxAddedFrictionFor * FSI_val;
-                                    float slope = (rest - minAddedFrictionFor) / (0.0f - noFrictionEffectZDelta);
-                                    friction = sycl::max(minAddedFrictionFor, slope * curr.z_delta + rest);
-                                }
-                                float alpha_calc = thread_alpha + sycl::max(0.0f, friction);
-                                thread_tanAlpha = sycl::tan(alpha_calc * 3.141592653589793f / 180.0f);
-                            }
-                        }
-                    }
-
-                    for (int dr = -1; dr <= 1; dr++) {
-                        for (int dc = -1; dc <= 1; dc++) {
-                            int r_idx = dr + 1;
-                            int c_idx = dc + 1;
-                            
-                            float ds = (dr != 0 && dc != 0) ? SQRT2 : 1.0f;
-                            if (dr == 0 && dc == 0) ds = 0.0f;
-                            
-                            float dem_val = dem[(curr.r + dr) * cols + (curr.c + dc)];
-                            float z_gamma = altitude - dem_val;
-                            float z_alpha = ds * cellsize * thread_tanAlpha;
-                            
-                            float zd_neigh = curr.z_delta + z_gamma - z_alpha;
-                            if (zd_neigh < 0.0f) zd_neigh = 0.0f;
-                            if (zd_neigh > thread_max_z_delta) zd_neigh = thread_max_z_delta;
-                            
-                            z_delta_neighbour[r_idx][c_idx] = zd_neigh;
-                        }
-                    }
-                    
-                    // Calc persistence
-                    float persistence[3][3] = {0.0f};
-                    float no_flow[3][3] = {
-                        {1.0f, 1.0f, 1.0f},
-                        {1.0f, 1.0f, 1.0f},
-                        {1.0f, 1.0f, 1.0f}
-                    };
-                    
-                    if (curr.is_start || curr.parent_is_start) {
-                        for (int r = 0; r < 3; r++) {
-                            for (int c = 0; c < 3; c++) {
-                                persistence[r][c] = 1.0f;
-                            }
-                        }
-                    } else {
-                        for (int dr = -1; dr <= 1; dr++) {
-                            for (int dc = -1; dc <= 1; dc++) {
-                                float maxweight = curr.parent_z_deltas[dr + 1][dc + 1];
-                                if (maxweight > 0.0f) {
-                                    no_flow[dr + 1][dc + 1] = 0.0f;
-                                    int dx = dc;
-                                    int dy = dr;
-                                    
-                                    if (dx == -1) {
-                                        if (dy == -1) {
-                                            persistence[2][2] += maxweight;
-                                            persistence[2][1] += 0.707f * maxweight;
-                                            persistence[1][2] += 0.707f * maxweight;
-                                        } else if (dy == 0) {
-                                            persistence[1][2] += maxweight;
-                                            persistence[2][2] += 0.707f * maxweight;
-                                            persistence[0][2] += 0.707f * maxweight;
-                                        } else if (dy == 1) {
-                                            persistence[0][2] += maxweight;
-                                            persistence[0][1] += 0.707f * maxweight;
-                                            persistence[1][2] += 0.707f * maxweight;
-                                        }
-                                    } else if (dx == 0) {
-                                        if (dy == -1) {
-                                            persistence[2][1] += maxweight;
-                                            persistence[2][0] += 0.707f * maxweight;
-                                            persistence[2][2] += 0.707f * maxweight;
-                                        } else if (dy == 1) {
-                                            persistence[0][1] += maxweight;
-                                            persistence[0][0] += 0.707f * maxweight;
-                                            persistence[0][2] += 0.707f * maxweight;
-                                        }
-                                    } else if (dx == 1) {
-                                        if (dy == -1) {
-                                            persistence[2][0] += maxweight;
-                                            persistence[1][0] += 0.707f * maxweight;
-                                            persistence[2][1] += 0.707f * maxweight;
-                                        } else if (dy == 0) {
-                                            persistence[1][0] += maxweight;
-                                            persistence[0][0] += 0.707f * maxweight;
-                                            persistence[2][0] += 0.707f * maxweight;
-                                        } else if (dy == 1) {
-                                            persistence[0][0] += maxweight;
-                                            persistence[0][1] += 0.707f * maxweight;
-                                            persistence[1][0] += 0.707f * maxweight;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    for (int r = 0; r < 3; r++) {
-                        for (int c = 0; c < 3; c++) {
-                            persistence[r][c] *= no_flow[r][c];
-                        }
-                    }
-                    
-                    // Calc tan_beta
-                    float tan_beta[3][3] = {0.0f};
-                    float r_t[3][3] = {0.0f};
-                    float sum_rt = 0.0f;
-                    
-                    for (int dr = -1; dr <= 1; dr++) {
-                        for (int dc = -1; dc <= 1; dc++) {
-                            if (dr == 0 && dc == 0) {
-                                continue;
-                            }
-                            int r_idx = dr + 1;
-                            int c_idx = dc + 1;
-                            
-                            if (z_delta_neighbour[r_idx][c_idx] <= 0.0f || persistence[r_idx][c_idx] <= 0.0f) {
-                                continue;
-                            }
-                            
-                            float ds = (dr != 0 && dc != 0) ? SQRT2 : 1.0f;
-                            float distance = ds * cellsize;
-                            float dem_val = dem[(curr.r + dr) * cols + (curr.c + dc)];
-                            float slope_term = (altitude - dem_val) / distance;
-                            float beta = sycl::atan(slope_term) + RAD90;
-                            float tb = sycl::tan(beta / 2.0f);
-                            
-                            tan_beta[r_idx][c_idx] = tb;
-                            float rt_val = sycl::pow(tb, static_cast<float>(thread_exp));
-                            r_t[r_idx][c_idx] = rt_val;
-                            sum_rt += rt_val;
-                        }
-                    }
-                    
-                    if (sum_rt > 0.0f) {
-                        for (int r = 0; r < 3; r++) {
-                            for (int c = 0; c < 3; c++) {
-                                r_t[r][c] /= sum_rt;
-                            }
-                        }
-                    }
-                    
-                    // Calc detrainment and adjust current flux
-                    float current_flux = curr.flux;
-                    if (forestBool && forestDetrainmentBool && !curr.is_start) {
-                        float FSI_val = forest_map[curr_flat];
-                        float rest = maxDetrainmentFor * FSI_val;
-                        float slope = 0.0f;
-                        if (noDetrainmentEffectZdelta != 0.0f) {
-                            slope = (rest - minDetrainmentFor) / (0.0f - noDetrainmentEffectZdelta);
-                        }
-                        float detrainment = sycl::max(minDetrainmentFor, slope * curr.z_delta + rest);
-                        current_flux = sycl::max(0.0003f, current_flux - detrainment);
-                    }
-
-                    // Calc dist
-                    float dist[3][3] = {0.0f};
-                    float sum_p_rt = 0.0f;
-                    for (int r = 0; r < 3; r++) {
-                        for (int c = 0; c < 3; c++) {
-                            dist[r][c] = persistence[r][c] * r_t[r][c];
-                            sum_p_rt += dist[r][c];
-                        }
-                    }
-                    
-                    if (sum_p_rt > 0.0f) {
-                        for (int r = 0; r < 3; r++) {
-                            for (int c = 0; c < 3; c++) {
-                                dist[r][c] = (dist[r][c] / sum_p_rt) * current_flux;
-                            }
-                        }
-                    }
-                    
-                    // Redistribute flux below threshold
-                    int count = 0;
-                    float mass_to_distribute = 0.0f;
-                    
-                    for (int r = 0; r < 3; r++) {
-                        for (int c = 0; c < 3; c++) {
-                            float d_val = dist[r][c];
-                            if (fluxDistOldVersionBool) {
-                                if (d_val > 0.0f && d_val < flux_threshold) {
-                                    count++;
-                                }
-                            } else {
-                                if (d_val >= flux_threshold) {
-                                    count++;
-                                }
-                            }
-                            if (d_val < flux_threshold) {
-                                mass_to_distribute += d_val;
-                            }
-                        }
-                    }
-                    
-                    if (mass_to_distribute > 0.0f && count > 0) {
-                        for (int r = 0; r < 3; r++) {
-                            for (int c = 0; c < 3; c++) {
-                                if (dist[r][c] >= flux_threshold) {
-                                    dist[r][c] += mass_to_distribute / static_cast<float>(count);
-                                } else {
-                                    dist[r][c] = 0.0f;
-                                }
-                            }
-                        }
-                    }
-                    
-                    float sum_dist = 0.0f;
-                    for (int r = 0; r < 3; r++) {
-                        for (int c = 0; c < 3; c++) {
-                            sum_dist += dist[r][c];
-                        }
-                    }
-                    
-                    if (sum_dist != current_flux && count > 0) {
-                        float diff = (current_flux - sum_dist) / static_cast<float>(count);
-                        for (int r = 0; r < 3; r++) {
-                            for (int c = 0; c < 3; c++) {
-                                if (dist[r][c] >= flux_threshold) {
-                                    dist[r][c] += diff;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Distribute to valid neighbors
-                    // Collect valid neighbors
-                    struct NeighborNode {
-                        int r;
-                        int c;
-                        float flux;
-                        float z_delta;
-                    };
-                    NeighborNode valid_neighbors[8];
-                    int num_valid = 0;
-
-                    for (int dr = -1; dr <= 1; dr++) {
-                        for (int dc = -1; dc <= 1; dc++) {
-                            if (dr == 0 && dc == 0) {
-                                continue;
-                            }
-                            int r_idx = dr + 1;
-                            int c_idx = dc + 1;
-                            float dist_val = dist[r_idx][c_idx];
-                            if (dist_val >= flux_threshold) {
-                                int nr = curr.r + dr;
-                                int nc = curr.c + dc;
-                                if (is_neighborhood_valid(nr, nc)) {
-                                    float z_delta_neigh_val = z_delta_neighbour[r_idx][c_idx];
-                                    valid_neighbors[num_valid++] = NeighborNode{nr, nc, dist_val, z_delta_neigh_val};
-                                }
-                            }
-                        }
-                    }
-
-                    // Sort valid neighbors lexicographically: z_delta, flux, r, c (ascending)
-                    for (int i = 0; i < num_valid - 1; i++) {
-                        for (int j = 0; j < num_valid - i - 1; j++) {
-                            bool swap_needed = false;
-                            if (valid_neighbors[j].z_delta != valid_neighbors[j + 1].z_delta) {
-                                swap_needed = valid_neighbors[j].z_delta > valid_neighbors[j + 1].z_delta;
-                            } else if (valid_neighbors[j].flux != valid_neighbors[j + 1].flux) {
-                                swap_needed = valid_neighbors[j].flux > valid_neighbors[j + 1].flux;
-                            } else if (valid_neighbors[j].r != valid_neighbors[j + 1].r) {
-                                swap_needed = valid_neighbors[j].r > valid_neighbors[j + 1].r;
-                            } else {
-                                swap_needed = valid_neighbors[j].c > valid_neighbors[j + 1].c;
-                            }
-
-                            if (swap_needed) {
-                                NeighborNode temp = valid_neighbors[j];
-                                valid_neighbors[j] = valid_neighbors[j + 1];
-                                valid_neighbors[j + 1] = temp;
-                            }
-                        }
-                    }
-
-                    // Distribute to valid neighbors in sorted order
-                    for (int n = 0; n < num_valid; n++) {
-                        int nr = valid_neighbors[n].r;
-                        int nc = valid_neighbors[n].c;
-                        float dist_val = valid_neighbors[n].flux;
-                        float z_delta_neigh_val = valid_neighbors[n].z_delta;
-                        int dr = nr - curr.r;
-                        int dc = nc - curr.c;
-
-                        int found_idx = -1;
-                        for (int i = q_idx; i < queue_size; i++) {
-                            if (queue[i].r == nr && queue[i].c == nc) {
-                                found_idx = i;
-                                break;
-                            }
-                        }
-
-                        float dx = (dc == 0) ? 0.0f : cellsize;
-                        float dy = (dr == 0) ? 0.0f : cellsize;
-                        float dz = sycl::fabs(dem[curr_flat] - dem[nr * cols + nc]);
-                        float dist2d = sycl::sqrt(dx * dx + dy * dy);
-                        float dist3d = sycl::sqrt(dy * dy + dy * dy + dz * dz); // Replicate Python typo where dx is replaced by dy
-
-                        if (found_idx != -1) {
-                            queue[found_idx].flux += dist_val;
-                            queue[found_idx].parent_z_deltas[1 - dr][1 - dc] = curr.z_delta;
-                            if (z_delta_neigh_val > queue[found_idx].z_delta) {
-                                queue[found_idx].z_delta = z_delta_neigh_val;
-                                queue[found_idx].parent_is_start = curr.is_start;
-                            }
-                            
-                            float candidate_2d = curr.min_distance + dist2d;
-                            if (candidate_2d < queue[found_idx].min_distance) {
-                                queue[found_idx].min_distance = candidate_2d;
-                            }
-                            if (forestBool) {
-                                float candidate_3d = curr.minDistXYZ + dist3d;
-                                if (candidate_3d < queue[found_idx].minDistXYZ) {
-                                    queue[found_idx].minDistXYZ = candidate_3d;
-                                }
-                            }
-                            if (forestBool && forestInteraction) {
-                                int candidate_forest = curr.forest_int_count + queue[found_idx].isForest;
-                                if (candidate_forest < queue[found_idx].forest_int_count) {
-                                    queue[found_idx].forest_int_count = candidate_forest;
-                                }
-                            }
-                            
-                            // Add parent tracking
-                            bool already_parent = false;
-                            for (int p = 0; p < queue[found_idx].num_parents; p++) {
-                                if (queue[found_idx].parent_indices[p] == (q_idx - 1)) {
-                                    already_parent = true;
-                                    break;
-                                }
-                            }
-                            if (!already_parent && queue[found_idx].num_parents < 8) {
-                                queue[found_idx].parent_indices[queue[found_idx].num_parents++] = (q_idx - 1);
-                            }
+                // Sort valid neighbors lexicographically: z_delta, flux, r, c (ascending)
+                for (int i = 0; i < num_valid - 1; i++) {
+                    for (int j = 0; j < num_valid - i - 1; j++) {
+                        bool swap_needed = false;
+                        if (valid_neighbors[j].z_delta != valid_neighbors[j + 1].z_delta) {
+                            swap_needed = valid_neighbors[j].z_delta > valid_neighbors[j + 1].z_delta;
+                        } else if (valid_neighbors[j].flux != valid_neighbors[j + 1].flux) {
+                            swap_needed = valid_neighbors[j].flux > valid_neighbors[j + 1].flux;
+                        } else if (valid_neighbors[j].r != valid_neighbors[j + 1].r) {
+                            swap_needed = valid_neighbors[j].r > valid_neighbors[j + 1].r;
                         } else {
-                            if (queue_size < MAX_QUEUE_SIZE) {
-                                PathNode new_node;
-                                new_node.r = nr;
-                                new_node.c = nc;
-                                new_node.flux = dist_val;
-                                new_node.z_delta = z_delta_neigh_val;
-                                for (int r = 0; r < 3; r++) {
-                                    for (int c = 0; c < 3; c++) {
-                                        new_node.parent_z_deltas[r][c] = 0.0f;
-                                    }
-                                }
-                                new_node.parent_z_deltas[1 - dr][1 - dc] = curr.z_delta;
-                                new_node.is_start = false;
-                                new_node.parent_is_start = curr.is_start;
-                                
-                                new_node.min_distance = curr.min_distance + dist2d;
-                                if (forestBool) {
-                                    new_node.minDistXYZ = curr.minDistXYZ + dist3d;
-                                } else {
-                                    new_node.minDistXYZ = 0.0f;
-                                }
-                                new_node.isForest = (forestBool && forestInteraction && forest_map[nr * cols + nc] > 0.0f) ? 1 : 0;
-                                new_node.forest_int_count = curr.forest_int_count + new_node.isForest;
-                                
-                                new_node.num_parents = 1;
-                                new_node.parent_indices[0] = (q_idx - 1);
-                                
-                                queue[queue_size++] = new_node;
-                            }
+                            swap_needed = valid_neighbors[j].c > valid_neighbors[j + 1].c;
+                        }
+
+                        if (swap_needed) {
+                            NeighborNode temp = valid_neighbors[j];
+                            valid_neighbors[j] = valid_neighbors[j + 1];
+                            valid_neighbors[j + 1] = temp;
                         }
                     }
                 }
-                
-                // Write final outputs (z_delta, flux, counts)
-                for (int i = 0; i < queue_size; i++) {
-                    int flat = queue[i].r * cols + queue[i].c;
-                    
-                    sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
-                         atomic_z_delta(z_delta[flat]);
-                    atomic_z_delta.fetch_max(queue[i].z_delta);
-                    
-                    sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
-                         atomic_flux(flux[flat]);
-                    atomic_flux.fetch_max(queue[i].flux);
-                    
-                    // Count as visit if this is the first occurrence of the coordinate in the path queue
-                    bool first_occurrence = true;
-                    for (int j = 0; j < i; j++) {
-                        if (queue[j].r == queue[i].r && queue[j].c == queue[i].c) {
-                            first_occurrence = false;
+
+                // Distribute to valid neighbors in sorted order
+                for (int n = 0; n < num_valid; n++) {
+                    int nr = valid_neighbors[n].r;
+                    int nc = valid_neighbors[n].c;
+                    float dist_val = valid_neighbors[n].flux;
+                    float z_delta_neigh_val = valid_neighbors[n].z_delta;
+                    int dr = nr - curr.r;
+                    int dc = nc - curr.c;
+
+                    int found_idx = -1;
+                    for (int i = q_idx; i < queue_size; i++) {
+                        if (queue[i].r == nr && queue[i].c == nc) {
+                            found_idx = i;
                             break;
                         }
                     }
-                    if (first_occurrence) {
-                        sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
-                             atomic_counts(counts[flat]);
-                        atomic_counts.fetch_add(1);
-                    }
-                }
 
-                // Backtracking for Infrastructure
-                if (infraBool) {
-                    float node_infra[MAX_QUEUE_SIZE];
-                    for (int i = 0; i < queue_size; i++) {
-                        float infra_val = infra_map[queue[i].r * cols + queue[i].c];
-                        node_infra[i] = sycl::max(0.0f, infra_val);
-                    }
-                    for (int i = queue_size - 1; i >= 0; i--) {
-                        float val = node_infra[i];
-                        for (int p = 0; p < queue[i].num_parents; p++) {
-                            int p_idx = queue[i].parent_indices[p];
-                            if (val > node_infra[p_idx]) {
-                                node_infra[p_idx] = val;
+                    float dx = (dc == 0) ? 0.0f : cellsize;
+                    float dy = (dr == 0) ? 0.0f : cellsize;
+                    float dz = sycl::fabs(dem[curr_flat] - dem[nr * cols + nc]);
+                    float dist2d = sycl::sqrt(dx * dx + dy * dy);
+                    float dist3d = sycl::sqrt(dy * dy + dy * dy + dz * dz); // Replicate Python typo where dx is replaced by dy
+
+                    if (found_idx != -1) {
+                        queue[found_idx].flux += dist_val;
+                        queue[found_idx].parent_z_deltas[1 - dr][1 - dc] = curr.z_delta;
+                        if (z_delta_neigh_val > queue[found_idx].z_delta) {
+                            queue[found_idx].z_delta = z_delta_neigh_val;
+                            queue[found_idx].parent_is_start = curr.is_start;
+                        }
+                        
+                        float candidate_2d = curr.min_distance + dist2d;
+                        if (candidate_2d < queue[found_idx].min_distance) {
+                            queue[found_idx].min_distance = candidate_2d;
+                        }
+                        if (forestBool) {
+                            float candidate_3d = curr.minDistXYZ + dist3d;
+                            if (candidate_3d < queue[found_idx].minDistXYZ) {
+                                queue[found_idx].minDistXYZ = candidate_3d;
                             }
                         }
-                    }
-                    for (int i = 0; i < queue_size; i++) {
-                        int flat_idx = queue[i].r * cols + queue[i].c;
-                        sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
-                            atomic_backcalc(backcalc[flat_idx]);
-                        atomic_backcalc.fetch_max(node_infra[i]);
+                        if (forestBool && forestInteraction) {
+                            int candidate_forest = curr.forest_int_count + queue[found_idx].isForest;
+                            if (candidate_forest < queue[found_idx].forest_int_count) {
+                                queue[found_idx].forest_int_count = candidate_forest;
+                            }
+                        }
+                        
+                        // Add parent tracking
+                        bool already_parent = false;
+                        for (int p = 0; p < queue[found_idx].num_parents; p++) {
+                            if (queue[found_idx].parent_indices[p] == (q_idx - 1)) {
+                                already_parent = true;
+                                break;
+                            }
+                        }
+                        if (!already_parent && queue[found_idx].num_parents < 8) {
+                            queue[found_idx].parent_indices[queue[found_idx].num_parents++] = (q_idx - 1);
+                        }
+                    } else {
+                        if (queue_size < CAPACITY_PER_PATH) {
+                            PathNode new_node;
+                            new_node.r = nr;
+                            new_node.c = nc;
+                            new_node.flux = dist_val;
+                            new_node.z_delta = z_delta_neigh_val;
+                            for (int r = 0; r < 3; r++) {
+                                for (int c = 0; c < 3; c++) {
+                                    new_node.parent_z_deltas[r][c] = 0.0f;
+                                }
+                            }
+                            new_node.parent_z_deltas[1 - dr][1 - dc] = curr.z_delta;
+                            new_node.is_start = false;
+                            new_node.parent_is_start = curr.is_start;
+                            
+                            new_node.min_distance = curr.min_distance + dist2d;
+                            if (forestBool) {
+                                new_node.minDistXYZ = curr.minDistXYZ + dist3d;
+                            } else {
+                                new_node.minDistXYZ = 0.0f;
+                            }
+                            new_node.isForest = (forestBool && forestInteraction && forest_map[nr * cols + nc] > 0.0f) ? 1 : 0;
+                            new_node.forest_int_count = curr.forest_int_count + new_node.isForest;
+                            
+                            new_node.num_parents = 1;
+                            new_node.parent_indices[0] = (q_idx - 1);
+                            
+                            queue[queue_size++] = new_node;
+                        }
                     }
                 }
+            }
+            
+            // Write final outputs (z_delta, flux, counts)
+            for (int i = 0; i < queue_size; i++) {
+                int flat = queue[i].r * cols + queue[i].c;
                 
-                // Forest Interaction count update
-                if (forestBool && forestInteraction) {
-                    for (int i = 0; i < queue_size; i++) {
-                        int flat_idx = queue[i].r * cols + queue[i].c;
-                        sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
-                            atomic_forest(forest_int[flat_idx]);
-                        atomic_forest.fetch_min(static_cast<float>(queue[i].forest_int_count));
+                sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
+                     atomic_z_delta(z_delta[flat]);
+                atomic_z_delta.fetch_max(queue[i].z_delta);
+                
+                sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
+                     atomic_flux(flux[flat]);
+                atomic_flux.fetch_max(queue[i].flux);
+                
+                // Count as visit if this is the first occurrence of the coordinate in the path queue
+                bool first_occurrence = true;
+                for (int j = 0; j < i; j++) {
+                    if (queue[j].r == queue[i].r && queue[j].c == queue[i].c) {
+                        first_occurrence = false;
+                        break;
                     }
                 }
-            });
-        
+                if (first_occurrence) {
+                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
+                         atomic_counts(counts[flat]);
+                    atomic_counts.fetch_add(1);
+                }
+            }
+
+            // Backtracking for Infrastructure
+            if (infraBool && d_infra_pool != nullptr) {
+                float* node_infra = &d_infra_pool[static_cast<size_t>(thread_id) * CAPACITY_PER_PATH];
+                for (int i = 0; i < queue_size; i++) {
+                    float infra_val = infra_map[queue[i].r * cols + queue[i].c];
+                    node_infra[i] = sycl::max(0.0f, infra_val);
+                }
+                for (int i = queue_size - 1; i >= 0; i--) {
+                    float val = node_infra[i];
+                    for (int p = 0; p < queue[i].num_parents; p++) {
+                        int p_idx = queue[i].parent_indices[p];
+                        if (val > node_infra[p_idx]) {
+                            node_infra[p_idx] = val;
+                        }
+                    }
+                }
+                for (int i = 0; i < queue_size; i++) {
+                    int flat_idx = queue[i].r * cols + queue[i].c;
+                    sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
+                        atomic_backcalc(backcalc[flat_idx]);
+                    atomic_backcalc.fetch_max(node_infra[i]);
+                }
+            }
+            
+            // Forest Interaction count update
+            if (forestBool && forestInteraction) {
+                for (int i = 0; i < queue_size; i++) {
+                    int flat_idx = queue[i].r * cols + queue[i].c;
+                    sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
+                        atomic_forest(forest_int[flat_idx]);
+                    atomic_forest.fetch_min(static_cast<float>(queue[i].forest_int_count));
+                }
+            }
+        });
+    
         // Device to Host memory copies
         q.memcpy(host_z_delta.data(), z_delta, total_cells * sizeof(float));
         q.memcpy(host_flux.data(), flux, total_cells * sizeof(float));
@@ -787,6 +791,8 @@ py::tuple run_sycl_calculation(
         sycl::free(forest_map, q);
         sycl::free(backcalc, q);
         sycl::free(forest_int, q);
+        sycl::free(d_work_pool, q);
+        if (d_infra_pool) sycl::free(d_infra_pool, q);
     }
     
     // Convert vectors to 2D numpy arrays
