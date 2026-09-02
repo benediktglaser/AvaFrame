@@ -8,9 +8,14 @@ if(GCC_INSTALL_DIR)
     add_link_options("--gcc-install-dir=${GCC_INSTALL_DIR}")
 endif()
 
-# Let optimization flags be configured by the build type (e.g., CMAKE_BUILD_TYPE=Release)
+# Enforce Release build type with -O3 optimizations by default
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose build type: Release, Debug, RelWithDebInfo" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_compile_options(-O3 -Wno-unknown-cuda-version)
 
 find_package(pybind11 REQUIRED)
 find_package(AdaptiveCpp REQUIRED)
