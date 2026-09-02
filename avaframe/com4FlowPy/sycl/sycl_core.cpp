@@ -11,6 +11,7 @@ namespace py = pybind11;
 namespace sycl_flow {
 
 #define CAPACITY_PER_PATH 32768
+#define MAX_CONCURRENT_PATHS 1024
 
 struct PathNode {
     int r;
@@ -27,6 +28,34 @@ struct PathNode {
     int isForest;
     int forest_int_count;
 };
+
+inline void atomic_max_float(float* addr, float val) {
+    uint32_t* u_addr = reinterpret_cast<uint32_t*>(addr);
+    uint32_t old_u = *u_addr;
+    float old_f = sycl::bit_cast<float>(old_u);
+    while (val > old_f || old_f == -9999.0f) {
+        uint32_t new_u = sycl::bit_cast<uint32_t>(val);
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> ref(*u_addr);
+        if (ref.compare_exchange_strong(old_u, new_u)) {
+            break;
+        }
+        old_f = sycl::bit_cast<float>(old_u);
+    }
+}
+
+inline void atomic_min_float(float* addr, float val) {
+    uint32_t* u_addr = reinterpret_cast<uint32_t*>(addr);
+    uint32_t old_u = *u_addr;
+    float old_f = sycl::bit_cast<float>(old_u);
+    while (val < old_f || old_f == 999999.0f) {
+        uint32_t new_u = sycl::bit_cast<uint32_t>(val);
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> ref(*u_addr);
+        if (ref.compare_exchange_strong(old_u, new_u)) {
+            break;
+        }
+        old_f = sycl::bit_cast<float>(old_u);
+    }
+}
 
 py::tuple run_sycl_calculation(
     py::array_t<float> dem,
@@ -217,8 +246,9 @@ py::tuple run_sycl_calculation(
         float* backcalc = sycl::malloc_device<float>(total_cells, q);
         float* forest_int = sycl::malloc_device<float>(total_cells, q);
 
-        // Allocate Device Work Pool in USM global device memory
-        size_t total_pool_nodes = static_cast<size_t>(num_release_cells) * CAPACITY_PER_PATH;
+        // Allocate Device Work Pool in USM global device memory (bounded by MAX_CONCURRENT_PATHS)
+        size_t max_concurrent = std::min<size_t>(static_cast<size_t>(num_release_cells), MAX_CONCURRENT_PATHS);
+        size_t total_pool_nodes = max_concurrent * CAPACITY_PER_PATH;
         PathNode* d_work_pool = sycl::malloc_device<PathNode>(total_pool_nodes, q);
         float* d_infra_pool = infraBool ? sycl::malloc_device<float>(total_pool_nodes, q) : nullptr;
 
@@ -236,11 +266,14 @@ py::tuple run_sycl_calculation(
         q.memcpy(backcalc, host_backcalc.data(), total_cells * sizeof(float));
         q.memcpy(forest_int, host_forest_int.data(), total_cells * sizeof(float));
 
-        q.parallel_for(sycl::range<1>(num_release_cells), [=](sycl::id<1> idx) {
-            int thread_id = idx[0];
-            int start_flat_index = rel_indices[thread_id];
-            int start_row = start_flat_index / cols;
-            int start_col = start_flat_index % cols;
+        for (int batch_start = 0; batch_start < num_release_cells; batch_start += MAX_CONCURRENT_PATHS) {
+            int current_batch_size = std::min<int>(MAX_CONCURRENT_PATHS, num_release_cells - batch_start);
+            q.parallel_for(sycl::range<1>(current_batch_size), [=](sycl::id<1> idx) {
+                int thread_id = idx[0];
+                int global_rel_id = batch_start + thread_id;
+                int start_flat_index = rel_indices[global_rel_id];
+                int start_row = start_flat_index / cols;
+                int start_col = start_flat_index % cols;
             
             auto is_nodata = [=](float val) {
                 return sycl::isnan(val) || sycl::fabs(val - nodata) < 1e-3f;
@@ -711,13 +744,8 @@ py::tuple run_sycl_calculation(
             for (int i = 0; i < queue_size; i++) {
                 int flat = queue[i].r * cols + queue[i].c;
                 
-                sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
-                     atomic_z_delta(z_delta[flat]);
-                atomic_z_delta.fetch_max(queue[i].z_delta);
-                
-                sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
-                     atomic_flux(flux[flat]);
-                atomic_flux.fetch_max(queue[i].flux);
+                atomic_max_float(&z_delta[flat], queue[i].z_delta);
+                atomic_max_float(&flux[flat], queue[i].flux);
                 
                 // Count as visit if this is the first occurrence of the coordinate in the path queue
                 bool first_occurrence = true;
@@ -752,9 +780,7 @@ py::tuple run_sycl_calculation(
                 }
                 for (int i = 0; i < queue_size; i++) {
                     int flat_idx = queue[i].r * cols + queue[i].c;
-                    sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
-                        atomic_backcalc(backcalc[flat_idx]);
-                    atomic_backcalc.fetch_max(node_infra[i]);
+                    atomic_max_float(&backcalc[flat_idx], node_infra[i]);
                 }
             }
             
@@ -762,12 +788,12 @@ py::tuple run_sycl_calculation(
             if (forestBool && forestInteraction) {
                 for (int i = 0; i < queue_size; i++) {
                     int flat_idx = queue[i].r * cols + queue[i].c;
-                    sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
-                        atomic_forest(forest_int[flat_idx]);
-                    atomic_forest.fetch_min(static_cast<float>(queue[i].forest_int_count));
+                    atomic_min_float(&forest_int[flat_idx], static_cast<float>(queue[i].forest_int_count));
                 }
             }
         });
+        q.wait_and_throw();
+    }
     
         // Device to Host memory copies
         q.memcpy(host_z_delta.data(), z_delta, total_cells * sizeof(float));
