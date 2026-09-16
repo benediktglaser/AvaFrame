@@ -72,7 +72,7 @@ inline size_t determine_optimal_worker_count(sycl::queue& q, size_t num_release_
     size_t global_mem = dev.get_info<sycl::info::device::global_mem_size>();
     std::string dev_name = dev.get_info<sycl::info::device::name>();
 
-    size_t bytes_per_worker = CAPACITY_PER_PATH * sizeof(PathNode); // ~2.44 MB
+    size_t bytes_per_worker = CAPACITY_PER_PATH * sizeof(PathNode); // ~3.38 MB
     size_t optimal_workers = 1024;
 
     if (is_cpu) {
@@ -80,26 +80,18 @@ inline size_t determine_optimal_worker_count(sycl::queue& q, size_t num_release_
         optimal_workers = std::max<size_t>(1, compute_units);
     } else {
         // Discrete GPU:
-        // 1. VRAM Ceiling: Allocate at most 30% of total VRAM to the work pool to prevent OOM
-        size_t max_pool_budget = static_cast<size_t>(global_mem * 0.30);
-        size_t mem_limit_workers = max_pool_budget / bytes_per_worker;
+        // 1. Memory Ceiling: Allow up to 80% VRAM on large GPUs (>=10 GB) or 50% on smaller GPUs
+        double vram_fraction = (global_mem >= 10ULL * 1024 * 1024 * 1024) ? 0.80 : 0.50;
+        size_t max_pool_budget = static_cast<size_t>(global_mem * vram_fraction);
+        
+        // 2. Dynamically compute maximum workers that fit into the allocated VRAM budget
+        size_t max_workers = max_pool_budget / bytes_per_worker;
 
-        // 2. Compute Occupancy Target:
-        // Aim for 32 to 48 workers per SM/CU to saturate warps without spilling memory
-        size_t compute_target_workers = compute_units * 32;
+        // 3. Snap down to a multiple of 128 (work-group size) so every GPU block is 100% full
+        optimal_workers = (max_workers >= 128) ? (max_workers / 128) * 128 : 128;
 
-        // Take min of compute target and memory limit
-        optimal_workers = std::min(compute_target_workers, mem_limit_workers);
-
-        // Snap to multiple of 128 (work-group size)
-        if (optimal_workers >= 128) {
-            optimal_workers = (optimal_workers / 128) * 128;
-        } else {
-            optimal_workers = 128;
-        }
-
-        // Clamp within safe GPU limits [128, 2048]
-        optimal_workers = std::clamp<size_t>(optimal_workers, 128, 2048);
+        // Ensure at least 128 workers
+        optimal_workers = std::max<size_t>(128, optimal_workers);
     }
 
     optimal_workers = std::min<size_t>(optimal_workers, num_release_cells);
