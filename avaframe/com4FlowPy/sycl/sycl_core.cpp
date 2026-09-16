@@ -57,6 +57,64 @@ inline void atomic_min_float(float* addr, float val) {
     }
 }
 
+inline size_t determine_optimal_worker_count(sycl::queue& q, size_t num_release_cells) {
+    const char* env_workers = std::getenv("ACPP_NUM_WORKERS");
+    if (env_workers != nullptr) {
+        size_t requested = std::stoul(env_workers);
+        size_t chosen = std::min<size_t>(num_release_cells, requested);
+        std::cout << "[SYCL Dynamic Occupancy] User override via ACPP_NUM_WORKERS: " << chosen << " persistent workers." << std::endl;
+        return chosen;
+    }
+
+    auto dev = q.get_device();
+    bool is_cpu = dev.is_cpu();
+    size_t compute_units = dev.get_info<sycl::info::device::max_compute_units>();
+    size_t global_mem = dev.get_info<sycl::info::device::global_mem_size>();
+    std::string dev_name = dev.get_info<sycl::info::device::name>();
+
+    size_t bytes_per_worker = CAPACITY_PER_PATH * sizeof(PathNode); // ~2.44 MB
+    size_t optimal_workers = 1024;
+
+    if (is_cpu) {
+        // For CPU devices, workers = CPU hardware threads/cores (e.g. 12 to 32)
+        optimal_workers = std::max<size_t>(1, compute_units);
+    } else {
+        // Discrete GPU:
+        // 1. VRAM Ceiling: Allocate at most 30% of total VRAM to the work pool to prevent OOM
+        size_t max_pool_budget = static_cast<size_t>(global_mem * 0.30);
+        size_t mem_limit_workers = max_pool_budget / bytes_per_worker;
+
+        // 2. Compute Occupancy Target:
+        // Aim for 32 to 48 workers per SM/CU to saturate warps without spilling memory
+        size_t compute_target_workers = compute_units * 32;
+
+        // Take min of compute target and memory limit
+        optimal_workers = std::min(compute_target_workers, mem_limit_workers);
+
+        // Snap to multiple of 128 (work-group size)
+        if (optimal_workers >= 128) {
+            optimal_workers = (optimal_workers / 128) * 128;
+        } else {
+            optimal_workers = 128;
+        }
+
+        // Clamp within safe GPU limits [128, 2048]
+        optimal_workers = std::clamp<size_t>(optimal_workers, 128, 2048);
+    }
+
+    optimal_workers = std::min<size_t>(optimal_workers, num_release_cells);
+
+    double vram_mb = (optimal_workers * bytes_per_worker) / (1024.0 * 1024.0);
+    double total_vram_gb = global_mem / (1024.0 * 1024.0 * 1024.0);
+
+    std::cout << "[SYCL Dynamic Occupancy] Target: " << dev_name 
+              << " (" << compute_units << " " << (is_cpu ? "Cores" : "Compute Units / SMs")
+              << ", " << total_vram_gb << " GB RAM) -> Auto-tuned Persistent Workers: " 
+              << optimal_workers << " (Work Pool VRAM: " << vram_mb << " MB)" << std::endl;
+
+    return optimal_workers;
+}
+
 py::tuple run_sycl_calculation(
     py::array_t<float> dem,
     py::array_t<float> release,
@@ -246,10 +304,8 @@ py::tuple run_sycl_calculation(
         float* backcalc = sycl::malloc_device<float>(total_cells, q);
         float* forest_int = sycl::malloc_device<float>(total_cells, q);
 
-        // Determine number of persistent workers (support ACPP_NUM_WORKERS env var for sweep testing)
-        const char* env_workers = std::getenv("ACPP_NUM_WORKERS");
-        size_t max_concurrency = env_workers ? std::stoul(env_workers) : MAX_CONCURRENT_PATHS;
-        size_t num_workers = std::min<size_t>(static_cast<size_t>(num_release_cells), max_concurrency);
+        // Dynamically determine optimal number of persistent workers based on device hardware
+        size_t num_workers = determine_optimal_worker_count(q, static_cast<size_t>(num_release_cells));
         size_t total_pool_nodes = num_workers * CAPACITY_PER_PATH;
         PathNode* d_work_pool = sycl::malloc_device<PathNode>(total_pool_nodes, q);
         float* d_infra_pool = infraBool ? sycl::malloc_device<float>(total_pool_nodes, q) : nullptr;
