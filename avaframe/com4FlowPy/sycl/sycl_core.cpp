@@ -2,6 +2,7 @@
 #include <pybind11/numpy.h>
 #include <sycl/sycl.hpp>
 #include <iostream>
+#include <iomanip>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -10,8 +11,10 @@ namespace py = pybind11;
 
 namespace sycl_flow {
 
-#define CAPACITY_PER_PATH 32768
-#define MAX_CONCURRENT_PATHS 1024
+struct WorkConfig {
+    size_t num_workers;
+    size_t capacity_per_path;
+};
 
 struct PathNode {
     int r;
@@ -57,54 +60,76 @@ inline void atomic_min_float(float* addr, float val) {
     }
 }
 
-inline size_t determine_optimal_worker_count(sycl::queue& q, size_t num_release_cells) {
-    const char* env_workers = std::getenv("ACPP_NUM_WORKERS");
-    if (env_workers != nullptr) {
-        size_t requested = std::stoul(env_workers);
-        size_t chosen = std::min<size_t>(num_release_cells, requested);
-        std::cout << "[SYCL Dynamic Occupancy] User override via ACPP_NUM_WORKERS: " << chosen << " persistent workers." << std::endl;
-        return chosen;
-    }
-
+inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_release_cells, size_t total_cells, bool infraBool) {
     auto dev = q.get_device();
     bool is_cpu = dev.is_cpu();
     size_t compute_units = dev.get_info<sycl::info::device::max_compute_units>();
     size_t global_mem = dev.get_info<sycl::info::device::global_mem_size>();
     std::string dev_name = dev.get_info<sycl::info::device::name>();
 
-    size_t bytes_per_worker = CAPACITY_PER_PATH * sizeof(PathNode); // ~3.38 MB
-    size_t optimal_workers = 1024;
+    size_t num_workers = 1024;
+    size_t capacity_per_path = 16384;
+    size_t bytes_per_node = sizeof(PathNode) + (infraBool ? sizeof(float) : 0);
 
     if (is_cpu) {
         // For CPU devices, workers = CPU hardware threads/cores (e.g. 12 to 32)
-        optimal_workers = std::max<size_t>(1, compute_units);
+        num_workers = std::max<size_t>(1, compute_units);
+        num_workers = std::min<size_t>(num_workers, num_release_cells);
+        capacity_per_path = std::min<size_t>(total_cells, 32768);
     } else {
         // Discrete GPU:
-        // 1. Memory Ceiling: Allow up to 80% VRAM on large GPUs (>=10 GB) or 50% on smaller GPUs
+        // 1. Target Full SM Occupancy: Dispatch at least 1 work-group (128 threads) per Compute Unit (SM/CU)
+        // Ensure we don't launch far more blocks than needed if release cells are small (e.g. unit tests)
+        size_t target_workers = compute_units * 128;
+        if (num_release_cells < 128) {
+            target_workers = 128;
+        }
+
+        // Check for manual user override via ACPP_NUM_WORKERS
+        const char* env_workers = std::getenv("ACPP_NUM_WORKERS");
+        if (env_workers != nullptr) {
+            target_workers = std::stoul(env_workers);
+            std::cout << "[SYCL Dynamic Config] User override via ACPP_NUM_WORKERS: " << target_workers << " workers." << std::endl;
+        }
+
+        // 2. Memory Budget: 80% on >= 10 GB GPUs, 50% on < 10 GB GPUs
         double vram_fraction = (global_mem >= 10ULL * 1024 * 1024 * 1024) ? 0.80 : 0.50;
-        size_t max_pool_budget = static_cast<size_t>(global_mem * vram_fraction);
-        
-        // 2. Dynamically compute maximum workers that fit into the allocated VRAM budget
-        size_t max_workers = max_pool_budget / bytes_per_worker;
+        size_t vram_budget = static_cast<size_t>(global_mem * vram_fraction);
 
-        // 3. Snap down to a multiple of 128 (work-group size) so every GPU block is 100% full
-        optimal_workers = (max_workers >= 128) ? (max_workers / 128) * 128 : 128;
+        // 3. Dynamically compute capacity per worker that strictly fits inside the VRAM budget
+        size_t raw_capacity = vram_budget / (target_workers * bytes_per_node);
 
-        // Ensure at least 128 workers
-        optimal_workers = std::max<size_t>(128, optimal_workers);
+        // If raw_capacity is smaller than a safe minimum (4,096), scale down workers in blocks of 128
+        if (raw_capacity < 4096) {
+            size_t min_capacity = 4096;
+            size_t max_allowed_workers = vram_budget / (min_capacity * bytes_per_node);
+            target_workers = (max_allowed_workers >= 128) ? (max_allowed_workers / 128) * 128 : 128;
+            raw_capacity = min_capacity;
+        }
+
+        // Clamp capacity: cannot exceed total_cells, and cap at 32,768
+        capacity_per_path = std::min<size_t>(raw_capacity, total_cells);
+        capacity_per_path = std::min<size_t>(capacity_per_path, 32768);
+        if (capacity_per_path >= 128) {
+            capacity_per_path = (capacity_per_path / 128) * 128;
+        }
+
+        num_workers = target_workers;
     }
 
-    optimal_workers = std::min<size_t>(optimal_workers, num_release_cells);
-
-    double vram_mb = (optimal_workers * bytes_per_worker) / (1024.0 * 1024.0);
+    double vram_mb = (num_workers * capacity_per_path * bytes_per_node) / (1024.0 * 1024.0);
     double total_vram_gb = global_mem / (1024.0 * 1024.0 * 1024.0);
+    size_t grid_blocks = (num_workers + 127) / 128;
 
-    std::cout << "[SYCL Dynamic Occupancy] Target: " << dev_name 
+    std::cout << "[SYCL Dynamic Config] Target: " << dev_name 
               << " (" << compute_units << " " << (is_cpu ? "Cores" : "Compute Units / SMs")
-              << ", " << total_vram_gb << " GB RAM) -> Auto-tuned Persistent Workers: " 
-              << optimal_workers << " (Work Pool VRAM: " << vram_mb << " MB)" << std::endl;
+              << ", " << total_vram_gb << " GB RAM)\n"
+              << "                      -> Auto-tuned Grid: " << grid_blocks << " Blocks (" 
+              << num_workers << " Persistent Workers)\n"
+              << "                      -> Queue Capacity: " << capacity_per_path << " nodes/worker "
+              << "(Work Pool VRAM: " << vram_mb << " MB)" << std::endl;
 
-    return optimal_workers;
+    return WorkConfig{num_workers, capacity_per_path};
 }
 
 py::tuple run_sycl_calculation(
@@ -296,9 +321,12 @@ py::tuple run_sycl_calculation(
         float* backcalc = sycl::malloc_device<float>(total_cells, q);
         float* forest_int = sycl::malloc_device<float>(total_cells, q);
 
-        // Dynamically determine optimal number of persistent workers based on device hardware
-        size_t num_workers = determine_optimal_worker_count(q, static_cast<size_t>(num_release_cells));
-        size_t total_pool_nodes = num_workers * CAPACITY_PER_PATH;
+        // Dynamically determine optimal configuration based on hardware and terrain
+        WorkConfig config = determine_optimal_configuration(q, static_cast<size_t>(num_release_cells), total_cells, infraBool);
+        size_t num_workers = config.num_workers;
+        size_t capacity_per_path = config.capacity_per_path;
+
+        size_t total_pool_nodes = num_workers * capacity_per_path;
         PathNode* d_work_pool = sycl::malloc_device<PathNode>(total_pool_nodes, q);
         float* d_infra_pool = infraBool ? sycl::malloc_device<float>(total_pool_nodes, q) : nullptr;
 
@@ -306,6 +334,11 @@ py::tuple run_sycl_calculation(
         int* d_task_counter = sycl::malloc_device<int>(1, q);
         int init_counter = 0;
         q.memcpy(d_task_counter, &init_counter, sizeof(int));
+
+        // Diagnostic: Track maximum queue depth reached across all paths
+        int* d_max_queue_depth = sycl::malloc_device<int>(1, q);
+        int init_max_depth = 0;
+        q.memcpy(d_max_queue_depth, &init_max_depth, sizeof(int));
 
         // Host to Device copies
         q.memcpy(rel_indices, release_flat_indices.data(), num_release_cells * sizeof(int));
@@ -324,11 +357,13 @@ py::tuple run_sycl_calculation(
         // Launch single persistent kernel over num_workers
         q.parallel_for(sycl::range<1>(num_workers), [=](sycl::id<1> idx) {
             int worker_id = idx[0];
-            PathNode* queue = &d_work_pool[static_cast<size_t>(worker_id) * CAPACITY_PER_PATH];
-            float* node_infra = d_infra_pool ? &d_infra_pool[static_cast<size_t>(worker_id) * CAPACITY_PER_PATH] : nullptr;
+            PathNode* queue = &d_work_pool[static_cast<size_t>(worker_id) * capacity_per_path];
+            float* node_infra = d_infra_pool ? &d_infra_pool[static_cast<size_t>(worker_id) * capacity_per_path] : nullptr;
 
             sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
                 task_counter(*d_task_counter);
+            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
+                max_depth_tracker(*d_max_queue_depth);
 
             auto is_nodata = [=](float val) {
                 return sycl::isnan(val) || sycl::fabs(val - nodata) < 1e-3f;
@@ -770,7 +805,7 @@ py::tuple run_sycl_calculation(
                             queue[found_idx].parent_indices[queue[found_idx].num_parents++] = (q_idx - 1);
                         }
                     } else {
-                        if (queue_size < CAPACITY_PER_PATH) {
+                        if (queue_size < capacity_per_path) {
                             PathNode new_node;
                             new_node.r = nr;
                             new_node.c = nc;
@@ -803,6 +838,9 @@ py::tuple run_sycl_calculation(
                 }
             }
             
+            // Diagnostic: record maximum queue depth reached by this worker
+            max_depth_tracker.fetch_max(queue_size);
+
             // Write final outputs (z_delta, flux, counts)
             for (int i = 0; i < queue_size; i++) {
                 int flat = queue[i].r * cols + queue[i].c;
@@ -856,6 +894,17 @@ py::tuple run_sycl_calculation(
             } // end while (true) work-stealing loop
         });
         q.wait_and_throw();
+
+        // Query diagnostic peak queue depth
+        int host_max_queue_depth = 0;
+        q.memcpy(&host_max_queue_depth, d_max_queue_depth, sizeof(int));
+        q.wait_and_throw();
+        sycl::free(d_max_queue_depth, q);
+
+        double queue_pct = (100.0 * host_max_queue_depth) / capacity_per_path;
+        std::cout << "[SYCL Diagnostic] Peak Queue Depth Reached: " << host_max_queue_depth 
+                  << " / " << capacity_per_path << " nodes (" << std::fixed << std::setprecision(1) 
+                  << queue_pct << "% capacity utilized)" << std::endl;
 
         // Device to Host memory copies
         q.memcpy(host_z_delta.data(), z_delta, total_cells * sizeof(float));
