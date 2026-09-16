@@ -13,6 +13,7 @@ namespace sycl_flow {
 
 struct WorkConfig {
     size_t num_workers;
+    size_t work_group_size;
     size_t capacity_per_path;
 };
 
@@ -68,43 +69,49 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
     std::string dev_name = dev.get_info<sycl::info::device::name>();
 
     size_t num_workers = 1024;
-    size_t capacity_per_path = 16384;
+    size_t work_group_size = 64;
+    size_t capacity_per_path = 32768;
     size_t bytes_per_node = sizeof(PathNode) + (infraBool ? sizeof(float) : 0);
 
     if (is_cpu) {
         // For CPU devices, workers = CPU hardware threads/cores (e.g. 12 to 32)
         num_workers = std::max<size_t>(1, compute_units);
         num_workers = std::min<size_t>(num_workers, num_release_cells);
+        work_group_size = 1;
         capacity_per_path = std::min<size_t>(total_cells, 32768);
     } else {
         // Discrete GPU:
-        // 1. Target Full SM Occupancy: Dispatch at least 1 work-group (128 threads) per Compute Unit (SM/CU)
-        // Ensure we don't launch far more blocks than needed if release cells are small (e.g. unit tests)
-        size_t target_workers = compute_units * 128;
-        if (num_release_cells < 128) {
-            target_workers = 128;
+        // Use work_group_size = 64 (2 warps) to allow full SM saturation (48 blocks)
+        // while preserving ample VRAM for deep path queues (~29k nodes)
+        work_group_size = 64;
+        size_t target_blocks = compute_units; // e.g. 48 blocks for 48 SMs
+        if (num_release_cells < work_group_size) {
+            target_blocks = 1;
         }
+        size_t target_workers = target_blocks * work_group_size;
 
         // Check for manual user override via ACPP_NUM_WORKERS
         const char* env_workers = std::getenv("ACPP_NUM_WORKERS");
         if (env_workers != nullptr) {
             target_workers = std::stoul(env_workers);
+            target_workers = ((target_workers + work_group_size - 1) / work_group_size) * work_group_size;
             std::cout << "[SYCL Dynamic Config] User override via ACPP_NUM_WORKERS: " << target_workers << " workers." << std::endl;
         }
 
-        // 2. Memory Budget: 80% on >= 10 GB GPUs, 50% on < 10 GB GPUs
+        // Memory Budget: 80% on >= 10 GB GPUs, 50% on < 10 GB GPUs
         double vram_fraction = (global_mem >= 10ULL * 1024 * 1024 * 1024) ? 0.80 : 0.50;
         size_t vram_budget = static_cast<size_t>(global_mem * vram_fraction);
 
-        // 3. Dynamically compute capacity per worker that strictly fits inside the VRAM budget
+        // Dynamically compute capacity per worker that strictly fits inside the VRAM budget
         size_t raw_capacity = vram_budget / (target_workers * bytes_per_node);
 
-        // If raw_capacity is smaller than a safe minimum (4,096), scale down workers in blocks of 128
-        if (raw_capacity < 4096) {
-            size_t min_capacity = 4096;
+        // If raw_capacity is smaller than 20,480 (safe floor to prevent path clipping in large avalanche bowls),
+        // scale down target_workers in multiples of work_group_size
+        if (raw_capacity < 20480 && vram_budget >= 20480 * bytes_per_node * work_group_size) {
+            size_t min_capacity = 20480;
             size_t max_allowed_workers = vram_budget / (min_capacity * bytes_per_node);
-            target_workers = (max_allowed_workers >= 128) ? (max_allowed_workers / 128) * 128 : 128;
-            raw_capacity = min_capacity;
+            target_workers = (max_allowed_workers >= work_group_size) ? (max_allowed_workers / work_group_size) * work_group_size : work_group_size;
+            raw_capacity = vram_budget / (target_workers * bytes_per_node);
         }
 
         // Clamp capacity: cannot exceed total_cells, and cap at 32,768
@@ -119,17 +126,17 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
 
     double vram_mb = (num_workers * capacity_per_path * bytes_per_node) / (1024.0 * 1024.0);
     double total_vram_gb = global_mem / (1024.0 * 1024.0 * 1024.0);
-    size_t grid_blocks = (num_workers + 127) / 128;
+    size_t grid_blocks = (num_workers + work_group_size - 1) / work_group_size;
 
     std::cout << "[SYCL Dynamic Config] Target: " << dev_name 
               << " (" << compute_units << " " << (is_cpu ? "Cores" : "Compute Units / SMs")
               << ", " << total_vram_gb << " GB RAM)\n"
               << "                      -> Auto-tuned Grid: " << grid_blocks << " Blocks (" 
-              << num_workers << " Persistent Workers)\n"
+              << num_workers << " Persistent Workers, WG Size: " << work_group_size << ")\n"
               << "                      -> Queue Capacity: " << capacity_per_path << " nodes/worker "
               << "(Work Pool VRAM: " << vram_mb << " MB)" << std::endl;
 
-    return WorkConfig{num_workers, capacity_per_path};
+    return WorkConfig{num_workers, work_group_size, capacity_per_path};
 }
 
 py::tuple run_sycl_calculation(
@@ -324,6 +331,7 @@ py::tuple run_sycl_calculation(
         // Dynamically determine optimal configuration based on hardware and terrain
         WorkConfig config = determine_optimal_configuration(q, static_cast<size_t>(num_release_cells), total_cells, infraBool);
         size_t num_workers = config.num_workers;
+        size_t work_group_size = config.work_group_size;
         size_t capacity_per_path = config.capacity_per_path;
 
         size_t total_pool_nodes = num_workers * capacity_per_path;
@@ -354,9 +362,9 @@ py::tuple run_sycl_calculation(
         q.memcpy(backcalc, host_backcalc.data(), total_cells * sizeof(float));
         q.memcpy(forest_int, host_forest_int.data(), total_cells * sizeof(float));
 
-        // Launch single persistent kernel over num_workers
-        q.parallel_for(sycl::range<1>(num_workers), [=](sycl::id<1> idx) {
-            int worker_id = idx[0];
+        // Launch single persistent kernel over num_workers with dynamic work-group size
+        q.parallel_for(sycl::nd_range<1>(sycl::range<1>(num_workers), sycl::range<1>(work_group_size)), [=](sycl::nd_item<1> item) {
+            int worker_id = static_cast<int>(item.get_global_id(0));
             PathNode* queue = &d_work_pool[static_cast<size_t>(worker_id) * capacity_per_path];
             float* node_infra = d_infra_pool ? &d_infra_pool[static_cast<size_t>(worker_id) * capacity_per_path] : nullptr;
 
