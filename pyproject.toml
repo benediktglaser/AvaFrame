@@ -95,6 +95,7 @@ setuptools-scm = "*"
 cibuildwheel = "*"
 # FSO: remove as soon as possible
 libgdal = "*"
+pybind11 = ">=3.1.0,<4"
 
 # Feature dev
 [tool.pixi.feature.dev.pypi-dependencies]
