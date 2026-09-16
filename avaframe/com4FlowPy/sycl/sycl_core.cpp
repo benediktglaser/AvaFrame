@@ -246,8 +246,10 @@ py::tuple run_sycl_calculation(
         float* backcalc = sycl::malloc_device<float>(total_cells, q);
         float* forest_int = sycl::malloc_device<float>(total_cells, q);
 
-        // Allocate Device Work Pool for fixed pool of persistent workers
-        size_t num_workers = std::min<size_t>(static_cast<size_t>(num_release_cells), MAX_CONCURRENT_PATHS);
+        // Determine number of persistent workers (support ACPP_NUM_WORKERS env var for sweep testing)
+        const char* env_workers = std::getenv("ACPP_NUM_WORKERS");
+        size_t max_concurrency = env_workers ? std::stoul(env_workers) : MAX_CONCURRENT_PATHS;
+        size_t num_workers = std::min<size_t>(static_cast<size_t>(num_release_cells), max_concurrency);
         size_t total_pool_nodes = num_workers * CAPACITY_PER_PATH;
         PathNode* d_work_pool = sycl::malloc_device<PathNode>(total_pool_nodes, q);
         float* d_infra_pool = infraBool ? sycl::malloc_device<float>(total_pool_nodes, q) : nullptr;

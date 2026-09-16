@@ -69,3 +69,8 @@ avaframe/com4FlowPy/sycl/*.so
 # Local run/test data and config files
 *_com1DFACfg.ini
 /data/
+
+# Profiler trace outputs
+*.nsys-rep
+*.ncu-rep
+*.sqlite
