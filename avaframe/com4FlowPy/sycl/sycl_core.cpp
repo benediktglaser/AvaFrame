@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cstdint>
 
 namespace py = pybind11;
 
@@ -17,21 +18,53 @@ struct WorkConfig {
     size_t capacity_per_path;
 };
 
-struct PathNode {
-    int r;
-    int c;
-    float flux;
-    float z_delta;
-    float parent_z_deltas[3][3];
-    bool is_start;
-    bool parent_is_start;
-    int parent_indices[8];
-    int num_parents;
-    float min_distance;
-    float minDistXYZ;
-    int isForest;
-    int forest_int_count;
+struct SoAQueueDeviceView {
+    int* r;
+    int* c;
+    float* flux;
+    float* z_delta;
+    float* parent_z_deltas;     // 9 floats per slot: index = (s * num_workers + w) * 9 + (dr*3 + dc)
+    uint8_t* is_start;          // uint8_t instead of bool for predictable alignment
+    uint8_t* parent_is_start;
+    int* parent_indices;        // 8 ints per slot: index = (s * num_workers + w) * 8 + p
+    int* num_parents;
+    float* min_distance;
+    float* minDistXYZ;
+    int* isForest;
+    int* forest_int_count;
+    float* node_infra;
+
+    size_t num_workers;
+    size_t capacity_per_path;
+
+    inline size_t idx(size_t slot, int worker_id) const {
+        return slot * num_workers + static_cast<size_t>(worker_id);
+    }
+
+    inline size_t parent_zd_idx(size_t slot, int worker_id, int r, int c) const {
+        return (slot * num_workers + static_cast<size_t>(worker_id)) * 9 + static_cast<size_t>(r * 3 + c);
+    }
+
+    inline size_t parent_idx(size_t slot, int worker_id, int p) const {
+        return (slot * num_workers + static_cast<size_t>(worker_id)) * 8 + static_cast<size_t>(p);
+    }
 };
+
+inline constexpr size_t align_128(size_t bytes) {
+    return (bytes + 127) & ~static_cast<size_t>(127);
+}
+
+inline constexpr size_t soa_bytes_per_node(bool infraBool) {
+    return (sizeof(int) * 2          // r, c
+          + sizeof(float) * 2        // flux, z_delta
+          + sizeof(float) * 9        // parent_z_deltas
+          + sizeof(uint8_t) * 2      // is_start, parent_is_start
+          + sizeof(int) * 8          // parent_indices
+          + sizeof(int)              // num_parents
+          + sizeof(float) * 2        // min_distance, minDistXYZ
+          + sizeof(int) * 2)         // isForest, forest_int_count
+          + (infraBool ? sizeof(float) : 0); // node_infra
+}
 
 inline void atomic_max_float(float* addr, float val) {
     uint32_t* u_addr = reinterpret_cast<uint32_t*>(addr);
@@ -71,7 +104,7 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
     size_t num_workers = 1024;
     size_t work_group_size = 64;
     size_t capacity_per_path = 32768;
-    size_t bytes_per_node = sizeof(PathNode) + (infraBool ? sizeof(float) : 0);
+    size_t bytes_per_node = soa_bytes_per_node(infraBool);
 
     if (is_cpu) {
         // For CPU devices, workers = CPU hardware threads/cores (e.g. 12 to 32)
@@ -334,9 +367,63 @@ py::tuple run_sycl_calculation(
         size_t work_group_size = config.work_group_size;
         size_t capacity_per_path = config.capacity_per_path;
 
-        size_t total_pool_nodes = num_workers * capacity_per_path;
-        PathNode* d_work_pool = sycl::malloc_device<PathNode>(total_pool_nodes, q);
-        float* d_infra_pool = infraBool ? sycl::malloc_device<float>(total_pool_nodes, q) : nullptr;
+        size_t total_elements = num_workers * capacity_per_path;
+
+        // Calculate sizes
+        size_t size_r = total_elements * sizeof(int);
+        size_t size_c = total_elements * sizeof(int);
+        size_t size_flux = total_elements * sizeof(float);
+        size_t size_z_delta = total_elements * sizeof(float);
+        size_t size_parent_zd = total_elements * 9 * sizeof(float);
+        size_t size_is_start = total_elements * sizeof(uint8_t);
+        size_t size_parent_is_start = total_elements * sizeof(uint8_t);
+        size_t size_parent_indices = total_elements * 8 * sizeof(int);
+        size_t size_num_parents = total_elements * sizeof(int);
+        size_t size_min_dist = total_elements * sizeof(float);
+        size_t size_min_dist_xyz = total_elements * sizeof(float);
+        size_t size_is_forest = total_elements * sizeof(int);
+        size_t size_forest_int = total_elements * sizeof(int);
+        size_t size_infra = infraBool ? (total_elements * sizeof(float)) : 0;
+
+        size_t offset = 0;
+        size_t offset_r = offset; offset += align_128(size_r);
+        size_t offset_c = offset; offset += align_128(size_c);
+        size_t offset_flux = offset; offset += align_128(size_flux);
+        size_t offset_z_delta = offset; offset += align_128(size_z_delta);
+        size_t offset_parent_zd = offset; offset += align_128(size_parent_zd);
+        size_t offset_is_start = offset; offset += align_128(size_is_start);
+        size_t offset_parent_is_start = offset; offset += align_128(size_parent_is_start);
+        size_t offset_parent_indices = offset; offset += align_128(size_parent_indices);
+        size_t offset_num_parents = offset; offset += align_128(size_num_parents);
+        size_t offset_min_dist = offset; offset += align_128(size_min_dist);
+        size_t offset_min_dist_xyz = offset; offset += align_128(size_min_dist_xyz);
+        size_t offset_is_forest = offset; offset += align_128(size_is_forest);
+        size_t offset_forest_int = offset; offset += align_128(size_forest_int);
+        size_t offset_infra = offset;
+        if (infraBool) {
+            offset += align_128(size_infra);
+        }
+        size_t total_work_pool_bytes = offset;
+
+        uint8_t* d_work_pool = sycl::malloc_device<uint8_t>(total_work_pool_bytes, q);
+
+        SoAQueueDeviceView q_view;
+        q_view.r = reinterpret_cast<int*>(d_work_pool + offset_r);
+        q_view.c = reinterpret_cast<int*>(d_work_pool + offset_c);
+        q_view.flux = reinterpret_cast<float*>(d_work_pool + offset_flux);
+        q_view.z_delta = reinterpret_cast<float*>(d_work_pool + offset_z_delta);
+        q_view.parent_z_deltas = reinterpret_cast<float*>(d_work_pool + offset_parent_zd);
+        q_view.is_start = reinterpret_cast<uint8_t*>(d_work_pool + offset_is_start);
+        q_view.parent_is_start = reinterpret_cast<uint8_t*>(d_work_pool + offset_parent_is_start);
+        q_view.parent_indices = reinterpret_cast<int*>(d_work_pool + offset_parent_indices);
+        q_view.num_parents = reinterpret_cast<int*>(d_work_pool + offset_num_parents);
+        q_view.min_distance = reinterpret_cast<float*>(d_work_pool + offset_min_dist);
+        q_view.minDistXYZ = reinterpret_cast<float*>(d_work_pool + offset_min_dist_xyz);
+        q_view.isForest = reinterpret_cast<int*>(d_work_pool + offset_is_forest);
+        q_view.forest_int_count = reinterpret_cast<int*>(d_work_pool + offset_forest_int);
+        q_view.node_infra = infraBool ? reinterpret_cast<float*>(d_work_pool + offset_infra) : nullptr;
+        q_view.num_workers = num_workers;
+        q_view.capacity_per_path = capacity_per_path;
 
         // Global Atomic Task Counter for Dynamic Work-Stealing
         int* d_task_counter = sycl::malloc_device<int>(1, q);
@@ -365,8 +452,8 @@ py::tuple run_sycl_calculation(
         // Launch single persistent kernel over num_workers with dynamic work-group size
         q.parallel_for(sycl::nd_range<1>(sycl::range<1>(num_workers), sycl::range<1>(work_group_size)), [=](sycl::nd_item<1> item) {
             int worker_id = static_cast<int>(item.get_global_id(0));
-            PathNode* queue = &d_work_pool[static_cast<size_t>(worker_id) * capacity_per_path];
-            float* node_infra = d_infra_pool ? &d_infra_pool[static_cast<size_t>(worker_id) * capacity_per_path] : nullptr;
+            const SoAQueueDeviceView queue_soa = q_view;
+            const auto& q = queue_soa;
 
             sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
                 task_counter(*d_task_counter);
@@ -410,15 +497,19 @@ py::tuple run_sycl_calculation(
 
                         // Write final outputs (z_delta, flux, counts)
                         for (int i = 0; i < queue_size; i++) {
-                            int flat = queue[i].r * cols + queue[i].c;
+                            size_t idx_i = q.idx(i, worker_id);
+                            int qi_r = q.r[idx_i];
+                            int qi_c = q.c[idx_i];
+                            int flat = qi_r * cols + qi_c;
                             
-                            atomic_max_float(&z_delta[flat], queue[i].z_delta);
-                            atomic_max_float(&flux[flat], queue[i].flux);
+                            atomic_max_float(&z_delta[flat], q.z_delta[idx_i]);
+                            atomic_max_float(&flux[flat], q.flux[idx_i]);
                             
                             // Count as visit if this is the first occurrence of the coordinate in the path queue
                             bool first_occurrence = true;
                             for (int j = 0; j < i; j++) {
-                                if (queue[j].r == queue[i].r && queue[j].c == queue[i].c) {
+                                size_t idx_j = q.idx(j, worker_id);
+                                if (q.r[idx_j] == qi_r && q.c[idx_j] == qi_c) {
                                     first_occurrence = false;
                                     break;
                                 }
@@ -431,31 +522,37 @@ py::tuple run_sycl_calculation(
                         }
 
                         // Backtracking for infrastructure
-                        if (infraBool && node_infra != nullptr) {
+                        if (infraBool && q.node_infra != nullptr) {
                             for (int i = 0; i < queue_size; i++) {
-                                float infra_val = infra_map[queue[i].r * cols + queue[i].c];
-                                node_infra[i] = sycl::max(0.0f, infra_val);
+                                size_t idx_i = q.idx(i, worker_id);
+                                float infra_val = infra_map[q.r[idx_i] * cols + q.c[idx_i]];
+                                q.node_infra[idx_i] = sycl::max(0.0f, infra_val);
                             }
                             for (int i = queue_size - 1; i >= 0; i--) {
-                                float val = node_infra[i];
-                                for (int p = 0; p < queue[i].num_parents; p++) {
-                                    int p_idx = queue[i].parent_indices[p];
-                                    if (val > node_infra[p_idx]) {
-                                        node_infra[p_idx] = val;
+                                size_t idx_i = q.idx(i, worker_id);
+                                float val = q.node_infra[idx_i];
+                                int np = q.num_parents[idx_i];
+                                for (int p = 0; p < np; p++) {
+                                    int p_idx = q.parent_indices[q.parent_idx(i, worker_id, p)];
+                                    size_t parent_mem_idx = q.idx(p_idx, worker_id);
+                                    if (val > q.node_infra[parent_mem_idx]) {
+                                        q.node_infra[parent_mem_idx] = val;
                                     }
                                 }
                             }
                             for (int i = 0; i < queue_size; i++) {
-                                int flat_idx = queue[i].r * cols + queue[i].c;
-                                atomic_max_float(&backcalc[flat_idx], node_infra[i]);
+                                size_t idx_i = q.idx(i, worker_id);
+                                int flat_idx = q.r[idx_i] * cols + q.c[idx_i];
+                                atomic_max_float(&backcalc[flat_idx], q.node_infra[idx_i]);
                             }
                         }
                         
                         // Forest interaction count update
                         if (forestBool && forestInteraction) {
                             for (int i = 0; i < queue_size; i++) {
-                                int flat_idx = queue[i].r * cols + queue[i].c;
-                                atomic_min_float(&forest_int[flat_idx], static_cast<float>(queue[i].forest_int_count));
+                                size_t idx_i = q.idx(i, worker_id);
+                                int flat_idx = q.r[idx_i] * cols + q.c[idx_i];
+                                atomic_min_float(&forest_int[flat_idx], static_cast<float>(q.forest_int_count[idx_i]));
                             }
                         }
 
@@ -489,23 +586,24 @@ py::tuple run_sycl_calculation(
                             
                             tanAlpha = sycl::tan(thread_alpha * 3.141592653589793f / 180.0f);
 
-                            PathNode& start_node = queue[queue_size++];
-                            start_node.r = start_row;
-                            start_node.c = start_col;
-                            start_node.flux = 1.0f;
-                            start_node.z_delta = 0.0f;
-                            for (int r = 0; r < 3; r++) {
-                                for (int c = 0; c < 3; c++) {
-                                    start_node.parent_z_deltas[r][c] = 0.0f;
-                                }
+                            size_t start_slot = static_cast<size_t>(queue_size++);
+                            size_t start_idx = q.idx(start_slot, worker_id);
+                            q.r[start_idx] = start_row;
+                            q.c[start_idx] = start_col;
+                            q.flux[start_idx] = 1.0f;
+                            q.z_delta[start_idx] = 0.0f;
+                            size_t base_pzd = start_idx * 9;
+                            for (int k = 0; k < 9; k++) {
+                                q.parent_z_deltas[base_pzd + k] = 0.0f;
                             }
-                            start_node.is_start = true;
-                            start_node.parent_is_start = false;
-                            start_node.num_parents = 0;
-                            start_node.min_distance = 0.0f;
-                            start_node.minDistXYZ = 0.0f;
-                            start_node.isForest = (forestBool && forestInteraction && forest_map[start_flat_index] > 0.0f) ? 1 : 0;
-                            start_node.forest_int_count = start_node.isForest;
+                            q.is_start[start_idx] = 1;
+                            q.parent_is_start[start_idx] = 0;
+                            q.num_parents[start_idx] = 0;
+                            q.min_distance[start_idx] = 0.0f;
+                            q.minDistXYZ[start_idx] = 0.0f;
+                            int start_is_forest = (forestBool && forestInteraction && forest_map[start_flat_index] > 0.0f) ? 1 : 0;
+                            q.isForest[start_idx] = start_is_forest;
+                            q.forest_int_count[start_idx] = start_is_forest;
                         } else {
                             queue_size = 0;
                             q_idx = 0;
@@ -522,8 +620,18 @@ py::tuple run_sycl_calculation(
                 }
 
                 if (has_work && (q_idx < queue_size)) {
-                    const PathNode& curr = queue[q_idx++];
-                int curr_flat = curr.r * cols + curr.c;
+                    int curr_slot = q_idx++;
+                    size_t curr_idx = q.idx(curr_slot, worker_id);
+                    int curr_r = q.r[curr_idx];
+                    int curr_c = q.c[curr_idx];
+                    int curr_flat = curr_r * cols + curr_c;
+                    float curr_flux = q.flux[curr_idx];
+                    float curr_z_delta = q.z_delta[curr_idx];
+                    uint8_t curr_is_start = q.is_start[curr_idx];
+                    uint8_t curr_parent_is_start = q.parent_is_start[curr_idx];
+                    float curr_min_distance = q.min_distance[curr_idx];
+                    float curr_minDistXYZ = q.minDistXYZ[curr_idx];
+                    int curr_forest_int_count = q.forest_int_count[curr_idx];
                 
                 // Calc z_delta_neighbour
                 float altitude = dem[curr_flat];
@@ -536,7 +644,7 @@ py::tuple run_sycl_calculation(
                 float thread_tanAlpha = tanAlpha;
                 if (forestBool) {
                     if (forest_module_enum == 3) { // forestFrictionLayer
-                        if (!curr.is_start && skipForestDist < curr.minDistXYZ) {
+                        if (!curr_is_start && skipForestDist < curr_minDistXYZ) {
                             float FSI_val = forest_map[curr_flat];
                             float AlphaFor = 0.0f;
                             if (friction_layer_type_enum == 0) {
@@ -549,12 +657,12 @@ py::tuple run_sycl_calculation(
                         }
                     } else if (forest_module_enum == 1 || forest_module_enum == 2) { // forestFriction / forestDetrainment
                         float FSI_val = forest_map[curr_flat];
-                        if (!curr.is_start && FSI_val > 0.0f && skipForestDist < curr.minDistXYZ) {
+                        if (!curr_is_start && FSI_val > 0.0f && skipForestDist < curr_minDistXYZ) {
                             float friction = minAddedFrictionFor;
-                            if (curr.z_delta < noFrictionEffectZDelta) {
+                            if (curr_z_delta < noFrictionEffectZDelta) {
                                 float rest = maxAddedFrictionFor * FSI_val;
                                 float slope = (rest - minAddedFrictionFor) / (0.0f - noFrictionEffectZDelta);
-                                friction = sycl::max(minAddedFrictionFor, slope * curr.z_delta + rest);
+                                friction = sycl::max(minAddedFrictionFor, slope * curr_z_delta + rest);
                             }
                             float alpha_calc = thread_alpha + sycl::max(0.0f, friction);
                             thread_tanAlpha = sycl::tan(alpha_calc * 3.141592653589793f / 180.0f);
@@ -570,11 +678,11 @@ py::tuple run_sycl_calculation(
                         float ds = (dr != 0 && dc != 0) ? SQRT2 : 1.0f;
                         if (dr == 0 && dc == 0) ds = 0.0f;
                         
-                        float dem_val = dem[(curr.r + dr) * cols + (curr.c + dc)];
+                        float dem_val = dem[(curr_r + dr) * cols + (curr_c + dc)];
                         float z_gamma = altitude - dem_val;
                         float z_alpha = ds * cellsize * thread_tanAlpha;
                         
-                        float zd_neigh = curr.z_delta + z_gamma - z_alpha;
+                        float zd_neigh = curr_z_delta + z_gamma - z_alpha;
                         if (zd_neigh < 0.0f) zd_neigh = 0.0f;
                         if (zd_neigh > thread_max_z_delta) zd_neigh = thread_max_z_delta;
                         
@@ -590,16 +698,17 @@ py::tuple run_sycl_calculation(
                     {1.0f, 1.0f, 1.0f}
                 };
                 
-                if (curr.is_start || curr.parent_is_start) {
+                if (curr_is_start || curr_parent_is_start) {
                     for (int r = 0; r < 3; r++) {
                         for (int c = 0; c < 3; c++) {
                             persistence[r][c] = 1.0f;
                         }
                     }
                 } else {
+                    size_t base_pzd = curr_idx * 9;
                     for (int dr = -1; dr <= 1; dr++) {
                         for (int dc = -1; dc <= 1; dc++) {
-                            float maxweight = curr.parent_z_deltas[dr + 1][dc + 1];
+                            float maxweight = q.parent_z_deltas[base_pzd + (dr + 1) * 3 + (dc + 1)];
                             if (maxweight > 0.0f) {
                                 no_flow[dr + 1][dc + 1] = 0.0f;
                                 int dx = dc;
@@ -674,7 +783,7 @@ py::tuple run_sycl_calculation(
                         
                         float ds = (dr != 0 && dc != 0) ? SQRT2 : 1.0f;
                         float distance = ds * cellsize;
-                        float dem_val = dem[(curr.r + dr) * cols + (curr.c + dc)];
+                        float dem_val = dem[(curr_r + dr) * cols + (curr_c + dc)];
                         float slope_term = (altitude - dem_val) / distance;
                         float beta = sycl::atan(slope_term) + RAD90;
                         float tb = sycl::tan(beta / 2.0f);
@@ -695,15 +804,15 @@ py::tuple run_sycl_calculation(
                 }
                 
                 // Calc detrainment and adjust current flux
-                float current_flux = curr.flux;
-                if (forestBool && forestDetrainmentBool && !curr.is_start) {
+                float current_flux = curr_flux;
+                if (forestBool && forestDetrainmentBool && !curr_is_start) {
                     float FSI_val = forest_map[curr_flat];
                     float rest = maxDetrainmentFor * FSI_val;
                     float slope = 0.0f;
                     if (noDetrainmentEffectZdelta != 0.0f) {
                         slope = (rest - minDetrainmentFor) / (0.0f - noDetrainmentEffectZdelta);
                     }
-                    float detrainment = sycl::max(minDetrainmentFor, slope * curr.z_delta + rest);
+                    float detrainment = sycl::max(minDetrainmentFor, slope * curr_z_delta + rest);
                     current_flux = sycl::max(0.0003f, current_flux - detrainment);
                 }
 
@@ -796,8 +905,8 @@ py::tuple run_sycl_calculation(
                         int c_idx = dc + 1;
                         float dist_val = dist[r_idx][c_idx];
                         if (dist_val >= flux_threshold) {
-                            int nr = curr.r + dr;
-                            int nc = curr.c + dc;
+                            int nr = curr_r + dr;
+                            int nc = curr_c + dc;
                             if (is_neighborhood_valid(nr, nc)) {
                                 float z_delta_neigh_val = z_delta_neighbour[r_idx][c_idx];
                                 valid_neighbors[num_valid++] = NeighborNode{nr, nc, dist_val, z_delta_neigh_val};
@@ -834,12 +943,13 @@ py::tuple run_sycl_calculation(
                     int nc = valid_neighbors[n].c;
                     float dist_val = valid_neighbors[n].flux;
                     float z_delta_neigh_val = valid_neighbors[n].z_delta;
-                    int dr = nr - curr.r;
-                    int dc = nc - curr.c;
+                    int dr = nr - curr_r;
+                    int dc = nc - curr_c;
 
                     int found_idx = -1;
                     for (int i = q_idx; i < queue_size; i++) {
-                        if (queue[i].r == nr && queue[i].c == nc) {
+                        size_t check_idx = q.idx(i, worker_id);
+                        if (q.r[check_idx] == nr && q.c[check_idx] == nc) {
                             found_idx = i;
                             break;
                         }
@@ -852,70 +962,74 @@ py::tuple run_sycl_calculation(
                     float dist3d = sycl::sqrt(dy * dy + dy * dy + dz * dz); // Replicate Python typo where dx is replaced by dy
 
                     if (found_idx != -1) {
-                        queue[found_idx].flux += dist_val;
-                        queue[found_idx].parent_z_deltas[1 - dr][1 - dc] = curr.z_delta;
-                        if (z_delta_neigh_val > queue[found_idx].z_delta) {
-                            queue[found_idx].z_delta = z_delta_neigh_val;
-                            queue[found_idx].parent_is_start = curr.is_start;
+                        size_t f_idx = q.idx(found_idx, worker_id);
+                        q.flux[f_idx] += dist_val;
+                        q.parent_z_deltas[q.parent_zd_idx(found_idx, worker_id, 1 - dr, 1 - dc)] = curr_z_delta;
+                        if (z_delta_neigh_val > q.z_delta[f_idx]) {
+                            q.z_delta[f_idx] = z_delta_neigh_val;
+                            q.parent_is_start[f_idx] = curr_is_start;
                         }
                         
-                        float candidate_2d = curr.min_distance + dist2d;
-                        if (candidate_2d < queue[found_idx].min_distance) {
-                            queue[found_idx].min_distance = candidate_2d;
+                        float candidate_2d = curr_min_distance + dist2d;
+                        if (candidate_2d < q.min_distance[f_idx]) {
+                            q.min_distance[f_idx] = candidate_2d;
                         }
                         if (forestBool) {
-                            float candidate_3d = curr.minDistXYZ + dist3d;
-                            if (candidate_3d < queue[found_idx].minDistXYZ) {
-                                queue[found_idx].minDistXYZ = candidate_3d;
+                            float candidate_3d = curr_minDistXYZ + dist3d;
+                            if (candidate_3d < q.minDistXYZ[f_idx]) {
+                                q.minDistXYZ[f_idx] = candidate_3d;
                             }
                         }
                         if (forestBool && forestInteraction) {
-                            int candidate_forest = curr.forest_int_count + queue[found_idx].isForest;
-                            if (candidate_forest < queue[found_idx].forest_int_count) {
-                                queue[found_idx].forest_int_count = candidate_forest;
+                            int candidate_forest = curr_forest_int_count + q.isForest[f_idx];
+                            if (candidate_forest < q.forest_int_count[f_idx]) {
+                                q.forest_int_count[f_idx] = candidate_forest;
                             }
                         }
                         
                         // Add parent tracking
                         bool already_parent = false;
-                        for (int p = 0; p < queue[found_idx].num_parents; p++) {
-                            if (queue[found_idx].parent_indices[p] == (q_idx - 1)) {
+                        int np = q.num_parents[f_idx];
+                        for (int p = 0; p < np; p++) {
+                            if (q.parent_indices[q.parent_idx(found_idx, worker_id, p)] == curr_slot) {
                                 already_parent = true;
                                 break;
                             }
                         }
-                        if (!already_parent && queue[found_idx].num_parents < 8) {
-                            queue[found_idx].parent_indices[queue[found_idx].num_parents++] = (q_idx - 1);
+                        if (!already_parent && np < 8) {
+                            q.parent_indices[q.parent_idx(found_idx, worker_id, np)] = curr_slot;
+                            q.num_parents[f_idx] = np + 1;
                         }
                     } else {
                         if (queue_size < capacity_per_path) {
-                            PathNode new_node;
-                            new_node.r = nr;
-                            new_node.c = nc;
-                            new_node.flux = dist_val;
-                            new_node.z_delta = z_delta_neigh_val;
-                            for (int r = 0; r < 3; r++) {
-                                for (int c = 0; c < 3; c++) {
-                                    new_node.parent_z_deltas[r][c] = 0.0f;
-                                }
-                            }
-                            new_node.parent_z_deltas[1 - dr][1 - dc] = curr.z_delta;
-                            new_node.is_start = false;
-                            new_node.parent_is_start = curr.is_start;
+                            size_t new_slot = static_cast<size_t>(queue_size++);
+                            size_t new_idx = q.idx(new_slot, worker_id);
+                            q.r[new_idx] = nr;
+                            q.c[new_idx] = nc;
+                            q.flux[new_idx] = dist_val;
+                            q.z_delta[new_idx] = z_delta_neigh_val;
                             
-                            new_node.min_distance = curr.min_distance + dist2d;
+                            size_t base_pzd = new_idx * 9;
+                            for (int k = 0; k < 9; k++) {
+                                q.parent_z_deltas[base_pzd + k] = 0.0f;
+                            }
+                            q.parent_z_deltas[base_pzd + (1 - dr) * 3 + (1 - dc)] = curr_z_delta;
+                            
+                            q.is_start[new_idx] = 0;
+                            q.parent_is_start[new_idx] = curr_is_start;
+                            
+                            q.min_distance[new_idx] = curr_min_distance + dist2d;
                             if (forestBool) {
-                                new_node.minDistXYZ = curr.minDistXYZ + dist3d;
+                                q.minDistXYZ[new_idx] = curr_minDistXYZ + dist3d;
                             } else {
-                                new_node.minDistXYZ = 0.0f;
+                                q.minDistXYZ[new_idx] = 0.0f;
                             }
-                            new_node.isForest = (forestBool && forestInteraction && forest_map[nr * cols + nc] > 0.0f) ? 1 : 0;
-                            new_node.forest_int_count = curr.forest_int_count + new_node.isForest;
+                            int new_is_forest = (forestBool && forestInteraction && forest_map[nr * cols + nc] > 0.0f) ? 1 : 0;
+                            q.isForest[new_idx] = new_is_forest;
+                            q.forest_int_count[new_idx] = curr_forest_int_count + new_is_forest;
                             
-                            new_node.num_parents = 1;
-                            new_node.parent_indices[0] = (q_idx - 1);
-                            
-                            queue[queue_size++] = new_node;
+                            q.num_parents[new_idx] = 1;
+                            q.parent_indices[q.parent_idx(new_slot, worker_id, 0)] = curr_slot;
                         }
                     }
                 }
@@ -959,7 +1073,6 @@ py::tuple run_sycl_calculation(
         sycl::free(forest_int, q);
         sycl::free(d_work_pool, q);
         sycl::free(d_task_counter, q);
-        if (d_infra_pool) sycl::free(d_infra_pool, q);
     }
     
     // Convert vectors to 2D numpy arrays
