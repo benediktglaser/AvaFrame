@@ -392,62 +392,137 @@ py::tuple run_sycl_calculation(
                 return true;
             };
 
+            sycl::sub_group sg = item.get_sub_group();
+            bool has_work = true;
+            int q_idx = 0;
+            int queue_size = 0;
+
+            float thread_max_z_delta = max_z_delta;
+            float thread_alpha = alpha;
+            int thread_exp = static_cast<int>(exp);
+            float tanAlpha = sycl::tan(thread_alpha * 3.141592653589793f / 180.0f);
+
             while (true) {
-                int my_task_id = task_counter.fetch_add(1);
-                if (my_task_id >= num_release_cells) {
+                // If path is complete, write results and claim next release cell
+                if (has_work && (q_idx == queue_size)) {
+                    if (queue_size > 0) {
+                        max_depth_tracker.fetch_max(queue_size);
+
+                        // Write final outputs (z_delta, flux, counts)
+                        for (int i = 0; i < queue_size; i++) {
+                            int flat = queue[i].r * cols + queue[i].c;
+                            
+                            atomic_max_float(&z_delta[flat], queue[i].z_delta);
+                            atomic_max_float(&flux[flat], queue[i].flux);
+                            
+                            // Count as visit if this is the first occurrence of the coordinate in the path queue
+                            bool first_occurrence = true;
+                            for (int j = 0; j < i; j++) {
+                                if (queue[j].r == queue[i].r && queue[j].c == queue[i].c) {
+                                    first_occurrence = false;
+                                    break;
+                                }
+                            }
+                            if (first_occurrence) {
+                                sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
+                                     atomic_counts(counts[flat]);
+                                atomic_counts.fetch_add(1);
+                            }
+                        }
+
+                        // Backtracking for infrastructure
+                        if (infraBool && node_infra != nullptr) {
+                            for (int i = 0; i < queue_size; i++) {
+                                float infra_val = infra_map[queue[i].r * cols + queue[i].c];
+                                node_infra[i] = sycl::max(0.0f, infra_val);
+                            }
+                            for (int i = queue_size - 1; i >= 0; i--) {
+                                float val = node_infra[i];
+                                for (int p = 0; p < queue[i].num_parents; p++) {
+                                    int p_idx = queue[i].parent_indices[p];
+                                    if (val > node_infra[p_idx]) {
+                                        node_infra[p_idx] = val;
+                                    }
+                                }
+                            }
+                            for (int i = 0; i < queue_size; i++) {
+                                int flat_idx = queue[i].r * cols + queue[i].c;
+                                atomic_max_float(&backcalc[flat_idx], node_infra[i]);
+                            }
+                        }
+                        
+                        // Forest interaction count update
+                        if (forestBool && forestInteraction) {
+                            for (int i = 0; i < queue_size; i++) {
+                                int flat_idx = queue[i].r * cols + queue[i].c;
+                                atomic_min_float(&forest_int[flat_idx], static_cast<float>(queue[i].forest_int_count));
+                            }
+                        }
+
+                        queue_size = 0;
+                        q_idx = 0;
+                    }
+
+                    int my_task_id = task_counter.fetch_add(1);
+                    if (my_task_id < num_release_cells) {
+                        int start_flat_index = rel_indices[my_task_id];
+                        int start_row = start_flat_index / cols;
+                        int start_col = start_flat_index % cols;
+
+                        if (is_neighborhood_valid(start_row, start_col)) {
+                            queue_size = 0;
+                            q_idx = 0;
+
+                            thread_max_z_delta = max_z_delta;
+                            thread_alpha = alpha;
+                            thread_exp = static_cast<int>(exp);
+
+                            if (varUmaxBool && var_umax[start_flat_index] > 0.0f && var_umax[start_flat_index] <= 8848.0f) {
+                                thread_max_z_delta = var_umax[start_flat_index];
+                            }
+                            if (varAlphaBool && var_alpha[start_flat_index] > 0.0f && var_alpha[start_flat_index] <= 90.0f) {
+                                thread_alpha = var_alpha[start_flat_index];
+                            }
+                            if (varExponentBool && var_exponent[start_flat_index] > 0.0f) {
+                                thread_exp = static_cast<int>(var_exponent[start_flat_index]);
+                            }
+                            
+                            tanAlpha = sycl::tan(thread_alpha * 3.141592653589793f / 180.0f);
+
+                            PathNode& start_node = queue[queue_size++];
+                            start_node.r = start_row;
+                            start_node.c = start_col;
+                            start_node.flux = 1.0f;
+                            start_node.z_delta = 0.0f;
+                            for (int r = 0; r < 3; r++) {
+                                for (int c = 0; c < 3; c++) {
+                                    start_node.parent_z_deltas[r][c] = 0.0f;
+                                }
+                            }
+                            start_node.is_start = true;
+                            start_node.parent_is_start = false;
+                            start_node.num_parents = 0;
+                            start_node.min_distance = 0.0f;
+                            start_node.minDistXYZ = 0.0f;
+                            start_node.isForest = (forestBool && forestInteraction && forest_map[start_flat_index] > 0.0f) ? 1 : 0;
+                            start_node.forest_int_count = start_node.isForest;
+                        } else {
+                            queue_size = 0;
+                            q_idx = 0;
+                        }
+                    } else {
+                        has_work = false;
+                        queue_size = 0;
+                        q_idx = 0;
+                    }
+                }
+
+                if (sycl::none_of_group(sg, has_work)) {
                     break;
                 }
 
-                int start_flat_index = rel_indices[my_task_id];
-                int start_row = start_flat_index / cols;
-                int start_col = start_flat_index % cols;
-
-                // Validate start cell neighborhood
-                if (!is_neighborhood_valid(start_row, start_col)) {
-                    continue;
-                }
-                
-                float thread_max_z_delta = max_z_delta;
-                float thread_alpha = alpha;
-                int thread_exp = static_cast<int>(exp);
-
-                if (varUmaxBool && var_umax[start_flat_index] > 0.0f && var_umax[start_flat_index] <= 8848.0f) {
-                    thread_max_z_delta = var_umax[start_flat_index];
-                }
-                if (varAlphaBool && var_alpha[start_flat_index] > 0.0f && var_alpha[start_flat_index] <= 90.0f) {
-                    thread_alpha = var_alpha[start_flat_index];
-                }
-                if (varExponentBool && var_exponent[start_flat_index] > 0.0f) {
-                    thread_exp = static_cast<int>(var_exponent[start_flat_index]);
-                }
-                
-                float tanAlpha = sycl::tan(thread_alpha * 3.141592653589793f / 180.0f);
-
-                int queue_size = 0;
-
-            PathNode start_node;
-            start_node.r = start_row;
-            start_node.c = start_col;
-            start_node.flux = 1.0f;
-            start_node.z_delta = 0.0f;
-            for (int r = 0; r < 3; r++) {
-                for (int c = 0; c < 3; c++) {
-                    start_node.parent_z_deltas[r][c] = 0.0f;
-                }
-            }
-            start_node.is_start = true;
-            start_node.parent_is_start = false;
-            start_node.num_parents = 0;
-            start_node.min_distance = 0.0f;
-            start_node.minDistXYZ = 0.0f;
-            start_node.isForest = (forestBool && forestInteraction && forest_map[start_flat_index] > 0.0f) ? 1 : 0;
-            start_node.forest_int_count = start_node.isForest;
-            
-            queue[queue_size++] = start_node;
-
-            int q_idx = 0;
-            while (q_idx < queue_size) {
-                PathNode curr = queue[q_idx++];
+                if (has_work && (q_idx < queue_size)) {
+                    const PathNode& curr = queue[q_idx++];
                 int curr_flat = curr.r * cols + curr.c;
                 
                 // Calc z_delta_neighbour
@@ -844,62 +919,8 @@ py::tuple run_sycl_calculation(
                         }
                     }
                 }
-            }
-            
-            // Diagnostic: record maximum queue depth reached by this worker
-            max_depth_tracker.fetch_max(queue_size);
-
-            // Write final outputs (z_delta, flux, counts)
-            for (int i = 0; i < queue_size; i++) {
-                int flat = queue[i].r * cols + queue[i].c;
-                
-                atomic_max_float(&z_delta[flat], queue[i].z_delta);
-                atomic_max_float(&flux[flat], queue[i].flux);
-                
-                // Count as visit if this is the first occurrence of the coordinate in the path queue
-                bool first_occurrence = true;
-                for (int j = 0; j < i; j++) {
-                    if (queue[j].r == queue[i].r && queue[j].c == queue[i].c) {
-                        first_occurrence = false;
-                        break;
-                    }
-                }
-                if (first_occurrence) {
-                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
-                         atomic_counts(counts[flat]);
-                    atomic_counts.fetch_add(1);
                 }
             }
-
-            // Backtracking for Infrastructure
-            if (infraBool && node_infra != nullptr) {
-                for (int i = 0; i < queue_size; i++) {
-                    float infra_val = infra_map[queue[i].r * cols + queue[i].c];
-                    node_infra[i] = sycl::max(0.0f, infra_val);
-                }
-                for (int i = queue_size - 1; i >= 0; i--) {
-                    float val = node_infra[i];
-                    for (int p = 0; p < queue[i].num_parents; p++) {
-                        int p_idx = queue[i].parent_indices[p];
-                        if (val > node_infra[p_idx]) {
-                            node_infra[p_idx] = val;
-                        }
-                    }
-                }
-                for (int i = 0; i < queue_size; i++) {
-                    int flat_idx = queue[i].r * cols + queue[i].c;
-                    atomic_max_float(&backcalc[flat_idx], node_infra[i]);
-                }
-            }
-            
-            // Forest Interaction count update
-            if (forestBool && forestInteraction) {
-                for (int i = 0; i < queue_size; i++) {
-                    int flat_idx = queue[i].r * cols + queue[i].c;
-                    atomic_min_float(&forest_int[flat_idx], static_cast<float>(queue[i].forest_int_count));
-                }
-            }
-            } // end while (true) work-stealing loop
         });
         q.wait_and_throw();
 
