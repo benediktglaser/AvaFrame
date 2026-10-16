@@ -16,10 +16,19 @@ struct WorkConfig {
     size_t num_workers;
     size_t work_group_size;
     size_t capacity_per_path;
+    size_t hash_capacity;
+    uint32_t hash_mask;
 };
 
-inline constexpr size_t HASH_CAPACITY = 32768;
-inline constexpr size_t HASH_MASK = 32767;
+inline size_t compute_hash_capacity(size_t capacity_per_path) {
+    // Ensure load factor <= ~0.70: required buckets >= capacity_per_path * 1.4
+    size_t min_buckets = capacity_per_path + (capacity_per_path * 2) / 5;
+    size_t hash_cap = 64;
+    while (hash_cap < min_buckets) {
+        hash_cap <<= 1;
+    }
+    return hash_cap;
+}
 
 struct SoAQueueDeviceView {
     int* r;
@@ -36,10 +45,13 @@ struct SoAQueueDeviceView {
     int* isForest;
     int* forest_int_count;
     float* node_infra;
-    uint64_t* hash_table;       // index(h, w) = h * num_workers + w
+    uint64_t* hash_keys;        // [63:32] task_tag (32b) | [31:0] flat_coord (32b), index(h, w) = h * num_workers + w
+    uint32_t* hash_slots;       // 32-bit queue_slot, index(h, w) = h * num_workers + w
 
     size_t num_workers;
     size_t capacity_per_path;
+    size_t hash_capacity;
+    uint32_t hash_mask;
 
     inline size_t idx(size_t slot, int worker_id) const {
         return slot * num_workers + static_cast<size_t>(worker_id);
@@ -105,6 +117,8 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
     size_t num_workers = 1024;
     size_t work_group_size = 64;
     size_t capacity_per_path = 32768;
+    size_t hash_capacity = 32768;
+    uint32_t hash_mask = 32767;
     size_t bytes_per_node = soa_bytes_per_node(infraBool, forestBool);
 
     if (is_cpu) {
@@ -112,16 +126,35 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
         num_workers = std::max<size_t>(1, compute_units);
         num_workers = std::min<size_t>(num_workers, num_release_cells);
         work_group_size = 1;
-        capacity_per_path = std::min<size_t>(total_cells, 32768);
+
+        const char* env_workers = std::getenv("ACPP_NUM_WORKERS");
+        if (env_workers != nullptr) {
+            num_workers = std::max<size_t>(1, std::stoul(env_workers));
+            std::cout << "[SYCL Dynamic Config] User override via ACPP_NUM_WORKERS: " << num_workers << " workers." << std::endl;
+        }
+
+        const char* env_q_cap = std::getenv("ACPP_QUEUE_CAPACITY");
+        if (env_q_cap != nullptr) {
+            capacity_per_path = std::stoul(env_q_cap);
+            std::cout << "[SYCL Dynamic Config] User override via ACPP_QUEUE_CAPACITY: " << capacity_per_path << " nodes/worker." << std::endl;
+        } else {
+            capacity_per_path = std::min<size_t>(total_cells, static_cast<size_t>(32768));
+        }
+        hash_capacity = compute_hash_capacity(capacity_per_path);
+        hash_mask = static_cast<uint32_t>(hash_capacity - 1);
     } else {
         // Discrete GPU:
-        // Use work_group_size = 64 (2 warps) to allow full SM saturation (48 blocks)
-        // while preserving ample VRAM for deep path queues (~29k nodes)
+        // Default work_group_size = 64 (2 warps on NVIDIA/AMD Wave32; 1 wavefront on Wave64)
         work_group_size = 64;
-        size_t target_blocks = compute_units; // e.g. 48 blocks for 48 SMs
-        if (num_release_cells < work_group_size) {
-            target_blocks = 1;
+        const char* env_wg_size = std::getenv("ACPP_WORK_GROUP_SIZE");
+        if (env_wg_size != nullptr) {
+            work_group_size = std::stoul(env_wg_size);
+            std::cout << "[SYCL Dynamic Config] User override via ACPP_WORK_GROUP_SIZE: " << work_group_size << std::endl;
         }
+
+        size_t target_blocks = compute_units;
+        size_t max_useful_blocks = (num_release_cells + work_group_size - 1) / work_group_size;
+        target_blocks = std::min(target_blocks, std::max<size_t>(1, max_useful_blocks));
         size_t target_workers = target_blocks * work_group_size;
 
         // Check for manual user override via ACPP_NUM_WORKERS
@@ -134,36 +167,47 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
 
         // Memory Budget: 80% on >= 10 GB GPUs, 50% on < 10 GB GPUs
         double vram_fraction = (global_mem >= 10ULL * 1024 * 1024 * 1024) ? 0.80 : 0.50;
+        const char* env_vram_frac = std::getenv("ACPP_VRAM_FRACTION");
+        if (env_vram_frac != nullptr) {
+            vram_fraction = std::stod(env_vram_frac);
+            std::cout << "[SYCL Dynamic Config] User override via ACPP_VRAM_FRACTION: " << vram_fraction << std::endl;
+        }
         size_t vram_budget = static_cast<size_t>(global_mem * vram_fraction);
 
-        // Account for hash_bytes_per_worker = HASH_CAPACITY * sizeof(uint64_t) when calculating raw_capacity
-        size_t total_hash_bytes = target_workers * HASH_CAPACITY * sizeof(uint64_t);
-        size_t remaining_vram = (vram_budget > total_hash_bytes) ? (vram_budget - total_hash_bytes) : (vram_budget / 2);
-        size_t raw_capacity = remaining_vram / (target_workers * bytes_per_node);
+        const char* env_q_cap = std::getenv("ACPP_QUEUE_CAPACITY");
+        if (env_q_cap != nullptr) {
+            capacity_per_path = std::stoul(env_q_cap);
+            std::cout << "[SYCL Dynamic Config] User override via ACPP_QUEUE_CAPACITY: " << capacity_per_path << " nodes/worker." << std::endl;
+            hash_capacity = compute_hash_capacity(capacity_per_path);
+            hash_mask = static_cast<uint32_t>(hash_capacity - 1);
+            num_workers = target_workers;
+        } else {
+            size_t safe_floor = std::min<size_t>(20480, total_cells);
+            size_t hash_cap = compute_hash_capacity(std::min<size_t>(total_cells, static_cast<size_t>(23000)));
+            size_t total_hash_bytes = target_workers * hash_cap * 12ULL;
+            size_t remaining_vram = (vram_budget > total_hash_bytes) ? (vram_budget - total_hash_bytes) : 0;
+            size_t raw_capacity = (target_workers > 0 && bytes_per_node > 0) ? (remaining_vram / (target_workers * bytes_per_node)) : 0;
 
-        // If raw_capacity is smaller than 20,480 (safe floor to prevent path clipping in large avalanche bowls),
-        // scale down target_workers in multiples of work_group_size
-        if (raw_capacity < 20480 && vram_budget >= 20480 * bytes_per_node * work_group_size) {
-            size_t min_capacity = 20480;
-            size_t bytes_per_worker = min_capacity * bytes_per_node + HASH_CAPACITY * sizeof(uint64_t);
-            size_t max_allowed_workers = vram_budget / bytes_per_worker;
-            target_workers = (max_allowed_workers >= work_group_size) ? (max_allowed_workers / work_group_size) * work_group_size : work_group_size;
-            total_hash_bytes = target_workers * HASH_CAPACITY * sizeof(uint64_t);
-            remaining_vram = (vram_budget > total_hash_bytes) ? (vram_budget - total_hash_bytes) : (vram_budget / 2);
-            raw_capacity = remaining_vram / (target_workers * bytes_per_node);
+            if (raw_capacity < safe_floor && vram_budget >= (safe_floor * bytes_per_node + hash_cap * 12ULL) * work_group_size) {
+                size_t bytes_per_worker = safe_floor * bytes_per_node + hash_cap * 12ULL;
+                size_t max_allowed_workers = vram_budget / bytes_per_worker;
+                target_workers = (max_allowed_workers >= work_group_size) ? (max_allowed_workers / work_group_size) * work_group_size : work_group_size;
+                total_hash_bytes = target_workers * hash_cap * 12ULL;
+                remaining_vram = (vram_budget > total_hash_bytes) ? (vram_budget - total_hash_bytes) : 0;
+                raw_capacity = remaining_vram / (target_workers * bytes_per_node);
+            }
+
+            capacity_per_path = std::min<size_t>(raw_capacity, std::min<size_t>(total_cells, static_cast<size_t>(32768)));
+            if (capacity_per_path >= 128) {
+                capacity_per_path = (capacity_per_path / 128) * 128;
+            }
+            hash_capacity = compute_hash_capacity(capacity_per_path);
+            hash_mask = static_cast<uint32_t>(hash_capacity - 1);
+            num_workers = target_workers;
         }
-
-        // Clamp capacity: cannot exceed total_cells, and cap at 32,768
-        capacity_per_path = std::min<size_t>(raw_capacity, total_cells);
-        capacity_per_path = std::min<size_t>(capacity_per_path, 32768);
-        if (capacity_per_path >= 128) {
-            capacity_per_path = (capacity_per_path / 128) * 128;
-        }
-
-        num_workers = target_workers;
     }
 
-    double vram_mb = (num_workers * (capacity_per_path * bytes_per_node + HASH_CAPACITY * sizeof(uint64_t))) / (1024.0 * 1024.0);
+    double vram_mb = (num_workers * (capacity_per_path * bytes_per_node + hash_capacity * 12ULL)) / (1024.0 * 1024.0);
     double total_vram_gb = global_mem / (1024.0 * 1024.0 * 1024.0);
     size_t grid_blocks = (num_workers + work_group_size - 1) / work_group_size;
 
@@ -172,10 +216,11 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
               << ", " << total_vram_gb << " GB RAM)\n"
               << "                      -> Auto-tuned Grid: " << grid_blocks << " Blocks (" 
               << num_workers << " Persistent Workers, WG Size: " << work_group_size << ")\n"
-              << "                      -> Queue Capacity: " << capacity_per_path << " nodes/worker "
+              << "                      -> Queue Capacity: " << capacity_per_path << " nodes/worker, "
+              << "Hash Capacity: " << hash_capacity << " buckets/worker "
               << "(Work Pool VRAM: " << vram_mb << " MB)" << std::endl;
 
-    return WorkConfig{num_workers, work_group_size, capacity_per_path};
+    return WorkConfig{num_workers, work_group_size, capacity_per_path, hash_capacity, hash_mask};
 }
 
 py::tuple run_sycl_calculation(
@@ -372,6 +417,8 @@ py::tuple run_sycl_calculation(
         size_t num_workers = config.num_workers;
         size_t work_group_size = config.work_group_size;
         size_t capacity_per_path = config.capacity_per_path;
+        size_t hash_capacity = config.hash_capacity;
+        uint32_t hash_mask = config.hash_mask;
 
         size_t total_elements = num_workers * capacity_per_path;
 
@@ -432,9 +479,10 @@ py::tuple run_sycl_calculation(
         uint8_t* d_work_pool = sycl::malloc_device<uint8_t>(total_work_pool_bytes, q);
 
         // Per-worker hash table pool in coalesced SoA layout: index(h, w) = h * num_workers + w
-        size_t total_hash_elements = num_workers * HASH_CAPACITY;
-        uint64_t* d_hash_pool = sycl::malloc_device<uint64_t>(total_hash_elements, q);
-        q.memset(d_hash_pool, 0, total_hash_elements * sizeof(uint64_t));
+        size_t total_hash_elements = num_workers * hash_capacity;
+        uint64_t* d_hash_keys = sycl::malloc_device<uint64_t>(total_hash_elements, q);
+        uint32_t* d_hash_slots = sycl::malloc_device<uint32_t>(total_hash_elements, q);
+        q.memset(d_hash_keys, 0, total_hash_elements * sizeof(uint64_t));
 
         SoAQueueDeviceView q_view;
         q_view.r = reinterpret_cast<int*>(d_work_pool + offset_r);
@@ -451,9 +499,12 @@ py::tuple run_sycl_calculation(
         q_view.isForest = forestBool ? reinterpret_cast<int*>(d_work_pool + offset_is_forest) : nullptr;
         q_view.forest_int_count = forestBool ? reinterpret_cast<int*>(d_work_pool + offset_forest_int) : nullptr;
         q_view.node_infra = infraBool ? reinterpret_cast<float*>(d_work_pool + offset_infra) : nullptr;
-        q_view.hash_table = d_hash_pool;
+        q_view.hash_keys = d_hash_keys;
+        q_view.hash_slots = d_hash_slots;
         q_view.num_workers = num_workers;
         q_view.capacity_per_path = capacity_per_path;
+        q_view.hash_capacity = hash_capacity;
+        q_view.hash_mask = hash_mask;
 
         // Global Atomic Task Counter for Dynamic Work-Stealing
         int* d_task_counter = sycl::malloc_device<int>(1, q);
@@ -608,18 +659,19 @@ py::tuple run_sycl_calculation(
                                 q.forest_int_count[start_idx] = start_is_forest;
                             }
 
-                            // Register root cell (start_flat_index) at slot = 0 in q.hash_table and increment counts[start_flat_index]
-                            uint64_t root_task_tag = static_cast<uint64_t>(my_task_id + 1) << 40;
-                            uint64_t root_target_key = root_task_tag | (static_cast<uint64_t>(start_flat_index) << 16);
-                            uint32_t root_h = (static_cast<uint32_t>(start_flat_index) * 2654435761u) & HASH_MASK;
-                            for (uint32_t probe = 0; probe < HASH_CAPACITY; probe++) {
+                            // Register root cell (start_flat_index) at slot = 0 in q.hash_keys/hash_slots and increment counts[start_flat_index]
+                            uint64_t root_task_tag = static_cast<uint64_t>(my_task_id + 1);
+                            uint64_t root_target_key = (root_task_tag << 32) | static_cast<uint32_t>(start_flat_index);
+                            uint32_t root_h = (static_cast<uint32_t>(start_flat_index) * 2654435761u) & q.hash_mask;
+                            for (size_t probe = 0; probe < q.hash_capacity; probe++) {
                                 size_t h_idx = static_cast<size_t>(root_h) * num_workers + static_cast<size_t>(worker_id);
-                                uint64_t entry = q.hash_table[h_idx];
-                                if ((entry >> 40) != static_cast<uint64_t>(my_task_id + 1)) {
-                                    q.hash_table[h_idx] = root_target_key | 0ULL;
+                                uint64_t key_entry = q.hash_keys[h_idx];
+                                if ((key_entry >> 32) != root_task_tag) {
+                                    q.hash_keys[h_idx] = root_target_key;
+                                    q.hash_slots[h_idx] = 0u;
                                     break;
                                 }
-                                root_h = (root_h + 1) & HASH_MASK;
+                                root_h = (root_h + 1) & q.hash_mask;
                             }
                             sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
                                 atomic_counts(counts[start_flat_index]);
@@ -974,22 +1026,22 @@ py::tuple run_sycl_calculation(
                     int dc = nc - curr_c;
                     int flat = nr * cols + nc;
 
-                    // Optimization A: O(1) Tag-Versioned SoA Hash Table Lookup
-                    uint64_t task_tag = static_cast<uint64_t>(my_task_id + 1) << 40;
-                    uint64_t target_key = task_tag | (static_cast<uint64_t>(flat) << 16);
-                    uint32_t h = (static_cast<uint32_t>(flat) * 2654435761u) & HASH_MASK;
+                    // Optimization A: O(1) Tag-Versioned Decoupled SoA Hash Table Lookup
+                    uint64_t task_tag = static_cast<uint64_t>(my_task_id + 1);
+                    uint64_t target_key = (task_tag << 32) | static_cast<uint32_t>(flat);
+                    uint32_t h = (static_cast<uint32_t>(flat) * 2654435761u) & q.hash_mask;
 
                     int found_idx = -1;
                     bool is_first_visit = false;
                     uint32_t target_h = h;
 
-                    for (uint32_t probe = 0; probe < HASH_CAPACITY; probe++) {
+                    for (size_t probe = 0; probe < q.hash_capacity; probe++) {
                         size_t h_idx = static_cast<size_t>(h) * num_workers + static_cast<size_t>(worker_id);
-                        uint64_t entry = q.hash_table[h_idx];
+                        uint64_t key_entry = q.hash_keys[h_idx];
 
-                        if ((entry & 0xFFFFFFFFFFFF0000ULL) == target_key) {
+                        if (key_entry == target_key) {
                             // Coordinate was already visited earlier in this release path!
-                            int prev_slot = static_cast<int>(entry & 0xFFFFULL);
+                            int prev_slot = static_cast<int>(q.hash_slots[h_idx]);
                             if (prev_slot >= q_idx) {
                                 // Still in the active unpopped frontier! Merge into prev_slot:
                                 found_idx = prev_slot;
@@ -997,13 +1049,13 @@ py::tuple run_sycl_calculation(
                             target_h = h;
                             break;
                         }
-                        if ((entry >> 40) != static_cast<uint64_t>(my_task_id + 1)) {
+                        if ((key_entry >> 32) != task_tag) {
                             // Unoccupied slot for this task -> First time this coordinate is visited in this path!
                             is_first_visit = true;
                             target_h = h;
                             break;
                         }
-                        h = (h + 1) & HASH_MASK;
+                        h = (h + 1) & q.hash_mask;
                     }
 
                     float dx = (dc == 0) ? 0.0f : cellsize;
@@ -1085,8 +1137,9 @@ py::tuple run_sycl_calculation(
                             }
 
                             // Update hash table entry
-                            q.hash_table[static_cast<size_t>(target_h) * num_workers + static_cast<size_t>(worker_id)] = 
-                                target_key | static_cast<uint64_t>(new_slot);
+                            size_t target_h_idx = static_cast<size_t>(target_h) * num_workers + static_cast<size_t>(worker_id);
+                            q.hash_keys[target_h_idx] = target_key;
+                            q.hash_slots[target_h_idx] = static_cast<uint32_t>(new_slot);
 
                             // If first visit to this coordinate in this path, increment global visit count
                             if (is_first_visit) {
@@ -1135,7 +1188,8 @@ py::tuple run_sycl_calculation(
         sycl::free(forest_map, q);
         sycl::free(backcalc, q);
         sycl::free(forest_int, q);
-        sycl::free(d_hash_pool, q);
+        sycl::free(d_hash_keys, q);
+        sycl::free(d_hash_slots, q);
         sycl::free(d_work_pool, q);
         sycl::free(d_task_counter, q);
     }
