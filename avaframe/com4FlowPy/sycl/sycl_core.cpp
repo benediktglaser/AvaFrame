@@ -12,22 +12,32 @@ namespace py = pybind11;
 
 namespace sycl_flow {
 
+struct alignas(8) HashEntry {
+    uint32_t flat_coord; // 32-bit DEM index (up to 4.29 billion cells)
+    uint16_t task_gen;   // Per-worker generation tag (1 .. 65535)
+    uint16_t ring_slot;  // Physical circular buffer slot (0 .. ring_mask)
+};
+static_assert(sizeof(HashEntry) == 8, "HashEntry must be 8 bytes");
+
 struct WorkConfig {
     size_t num_workers;
     size_t work_group_size;
     size_t capacity_per_path;
+    uint32_t ring_mask;
     size_t hash_capacity;
     uint32_t hash_mask;
 };
 
-inline size_t compute_hash_capacity(size_t capacity_per_path) {
-    // Ensure load factor <= ~0.70: required buckets >= capacity_per_path * 1.4
-    size_t min_buckets = capacity_per_path + (capacity_per_path * 2) / 5;
-    size_t hash_cap = 64;
-    while (hash_cap < min_buckets) {
-        hash_cap <<= 1;
+inline size_t next_pow2(size_t v) {
+    size_t p = 64;
+    while (p < v) {
+        p <<= 1;
     }
-    return hash_cap;
+    return p;
+}
+
+inline size_t compute_hash_capacity(size_t capacity_per_path) {
+    return next_pow2(capacity_per_path + (capacity_per_path * 2) / 5);
 }
 
 struct SoAQueueDeviceView {
@@ -35,34 +45,34 @@ struct SoAQueueDeviceView {
     int* c;
     float* flux;
     float* z_delta;
-    float* parent_z_deltas;     // 9 floats per slot: index = (s * num_workers + w) * 9 + (dr*3 + dc)
-    uint8_t* is_start;          // uint8_t instead of bool for predictable alignment
+    float* parent_z_deltas;     // 9 floats per slot: index = ((s & ring_mask) * num_workers + w) * 9 + (dr*3 + dc)
+    uint8_t* is_start;          // uint8_t instead of bool for predictable alignment: 0=normal, 1=root, 2=popped
     uint8_t* parent_is_start;
-    int* parent_indices;        // 8 ints per slot: index = (s * num_workers + w) * 8 + p
+    int* parent_indices;        // 8 ints per slot: index = ((s & ring_mask) * num_workers + w) * 8 + p
     int* num_parents;
     float* min_distance;
     float* minDistXYZ;
     int* isForest;
     int* forest_int_count;
     float* node_infra;
-    uint64_t* hash_keys;        // [63:32] task_tag (32b) | [31:0] flat_coord (32b), index(h, w) = h * num_workers + w
-    uint32_t* hash_slots;       // 32-bit queue_slot, index(h, w) = h * num_workers + w
+    HashEntry* hash_table;      // Interleaved SoA: index(h, w) = h * num_workers + w
 
     size_t num_workers;
     size_t capacity_per_path;
+    uint32_t ring_mask;
     size_t hash_capacity;
     uint32_t hash_mask;
 
     inline size_t idx(size_t slot, int worker_id) const {
-        return slot * num_workers + static_cast<size_t>(worker_id);
+        return (slot & ring_mask) * num_workers + static_cast<size_t>(worker_id);
     }
 
     inline size_t parent_zd_idx(size_t slot, int worker_id, int r, int c) const {
-        return (slot * num_workers + static_cast<size_t>(worker_id)) * 9 + static_cast<size_t>(r * 3 + c);
+        return ((slot & ring_mask) * num_workers + static_cast<size_t>(worker_id)) * 9 + static_cast<size_t>(r * 3 + c);
     }
 
     inline size_t parent_idx(size_t slot, int worker_id, int p) const {
-        return (slot * num_workers + static_cast<size_t>(worker_id)) * 8 + static_cast<size_t>(p);
+        return ((slot & ring_mask) * num_workers + static_cast<size_t>(worker_id)) * 8 + static_cast<size_t>(p);
     }
 };
 
@@ -116,7 +126,7 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
 
     size_t num_workers = 1024;
     size_t work_group_size = 64;
-    size_t capacity_per_path = 32768;
+    size_t capacity_per_path = infraBool ? 32768 : 4096;
     size_t hash_capacity = 32768;
     uint32_t hash_mask = 32767;
     size_t bytes_per_node = soa_bytes_per_node(infraBool, forestBool);
@@ -133,14 +143,19 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
             std::cout << "[SYCL Dynamic Config] User override via ACPP_NUM_WORKERS: " << num_workers << " workers." << std::endl;
         }
 
+        capacity_per_path = infraBool ? 32768 : 4096;
         const char* env_q_cap = std::getenv("ACPP_QUEUE_CAPACITY");
         if (env_q_cap != nullptr) {
-            capacity_per_path = std::stoul(env_q_cap);
+            capacity_per_path = std::min<size_t>(65536, next_pow2(std::stoul(env_q_cap)));
             std::cout << "[SYCL Dynamic Config] User override via ACPP_QUEUE_CAPACITY: " << capacity_per_path << " nodes/worker." << std::endl;
-        } else {
-            capacity_per_path = std::min<size_t>(total_cells, static_cast<size_t>(32768));
         }
-        hash_capacity = compute_hash_capacity(capacity_per_path);
+
+        hash_capacity = 32768;
+        const char* env_hash_cap = std::getenv("ACPP_HASH_CAPACITY");
+        if (env_hash_cap != nullptr) {
+            hash_capacity = next_pow2(std::stoul(env_hash_cap));
+            std::cout << "[SYCL Dynamic Config] User override via ACPP_HASH_CAPACITY: " << hash_capacity << " buckets/worker." << std::endl;
+        }
         hash_mask = static_cast<uint32_t>(hash_capacity - 1);
     } else {
         // Discrete GPU:
@@ -174,40 +189,49 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
         }
         size_t vram_budget = static_cast<size_t>(global_mem * vram_fraction);
 
+        hash_capacity = 32768;
+        const char* env_hash_cap = std::getenv("ACPP_HASH_CAPACITY");
+        if (env_hash_cap != nullptr) {
+            hash_capacity = next_pow2(std::stoul(env_hash_cap));
+            std::cout << "[SYCL Dynamic Config] User override via ACPP_HASH_CAPACITY: " << hash_capacity << " buckets/worker." << std::endl;
+        }
+        hash_mask = static_cast<uint32_t>(hash_capacity - 1);
+
+        size_t default_cap = infraBool ? 32768 : 4096;
         const char* env_q_cap = std::getenv("ACPP_QUEUE_CAPACITY");
         if (env_q_cap != nullptr) {
-            capacity_per_path = std::stoul(env_q_cap);
+            capacity_per_path = std::min<size_t>(65536, next_pow2(std::stoul(env_q_cap)));
             std::cout << "[SYCL Dynamic Config] User override via ACPP_QUEUE_CAPACITY: " << capacity_per_path << " nodes/worker." << std::endl;
-            hash_capacity = compute_hash_capacity(capacity_per_path);
-            hash_mask = static_cast<uint32_t>(hash_capacity - 1);
             num_workers = target_workers;
         } else {
-            size_t safe_floor = std::min<size_t>(20480, total_cells);
-            size_t hash_cap = compute_hash_capacity(std::min<size_t>(total_cells, static_cast<size_t>(23000)));
-            size_t total_hash_bytes = target_workers * hash_cap * 12ULL;
+            size_t total_hash_bytes = target_workers * hash_capacity * sizeof(HashEntry);
             size_t remaining_vram = (vram_budget > total_hash_bytes) ? (vram_budget - total_hash_bytes) : 0;
             size_t raw_capacity = (target_workers > 0 && bytes_per_node > 0) ? (remaining_vram / (target_workers * bytes_per_node)) : 0;
 
-            if (raw_capacity < safe_floor && vram_budget >= (safe_floor * bytes_per_node + hash_cap * 12ULL) * work_group_size) {
-                size_t bytes_per_worker = safe_floor * bytes_per_node + hash_cap * 12ULL;
+            if (raw_capacity < default_cap && vram_budget >= (default_cap * bytes_per_node + hash_capacity * sizeof(HashEntry)) * work_group_size) {
+                size_t bytes_per_worker = default_cap * bytes_per_node + hash_capacity * sizeof(HashEntry);
                 size_t max_allowed_workers = vram_budget / bytes_per_worker;
                 target_workers = (max_allowed_workers >= work_group_size) ? (max_allowed_workers / work_group_size) * work_group_size : work_group_size;
-                total_hash_bytes = target_workers * hash_cap * 12ULL;
+                total_hash_bytes = target_workers * hash_capacity * sizeof(HashEntry);
                 remaining_vram = (vram_budget > total_hash_bytes) ? (vram_budget - total_hash_bytes) : 0;
                 raw_capacity = remaining_vram / (target_workers * bytes_per_node);
             }
 
-            capacity_per_path = std::min<size_t>(raw_capacity, std::min<size_t>(total_cells, static_cast<size_t>(32768)));
-            if (capacity_per_path >= 128) {
-                capacity_per_path = (capacity_per_path / 128) * 128;
+            if (raw_capacity >= default_cap) {
+                capacity_per_path = default_cap;
+            } else {
+                size_t p = 64;
+                while ((p << 1) <= raw_capacity && (p << 1) <= default_cap) {
+                    p <<= 1;
+                }
+                capacity_per_path = p;
             }
-            hash_capacity = compute_hash_capacity(capacity_per_path);
-            hash_mask = static_cast<uint32_t>(hash_capacity - 1);
             num_workers = target_workers;
         }
     }
 
-    double vram_mb = (num_workers * (capacity_per_path * bytes_per_node + hash_capacity * 12ULL)) / (1024.0 * 1024.0);
+    uint32_t ring_mask = static_cast<uint32_t>(capacity_per_path - 1);
+    double vram_mb = (num_workers * (capacity_per_path * bytes_per_node + hash_capacity * sizeof(HashEntry))) / (1024.0 * 1024.0);
     double total_vram_gb = global_mem / (1024.0 * 1024.0 * 1024.0);
     size_t grid_blocks = (num_workers + work_group_size - 1) / work_group_size;
 
@@ -220,7 +244,7 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
               << "Hash Capacity: " << hash_capacity << " buckets/worker "
               << "(Work Pool VRAM: " << vram_mb << " MB)" << std::endl;
 
-    return WorkConfig{num_workers, work_group_size, capacity_per_path, hash_capacity, hash_mask};
+    return WorkConfig{num_workers, work_group_size, capacity_per_path, ring_mask, hash_capacity, hash_mask};
 }
 
 py::tuple run_sycl_calculation(
@@ -418,6 +442,7 @@ py::tuple run_sycl_calculation(
         size_t work_group_size = config.work_group_size;
         size_t capacity_per_path = config.capacity_per_path;
         size_t hash_capacity = config.hash_capacity;
+        uint32_t ring_mask = config.ring_mask;
         uint32_t hash_mask = config.hash_mask;
 
         size_t total_elements = num_workers * capacity_per_path;
@@ -480,9 +505,8 @@ py::tuple run_sycl_calculation(
 
         // Per-worker hash table pool in coalesced SoA layout: index(h, w) = h * num_workers + w
         size_t total_hash_elements = num_workers * hash_capacity;
-        uint64_t* d_hash_keys = sycl::malloc_device<uint64_t>(total_hash_elements, q);
-        uint32_t* d_hash_slots = sycl::malloc_device<uint32_t>(total_hash_elements, q);
-        q.memset(d_hash_keys, 0, total_hash_elements * sizeof(uint64_t));
+        HashEntry* d_hash_table = sycl::malloc_device<HashEntry>(total_hash_elements, q);
+        q.memset(d_hash_table, 0, total_hash_elements * sizeof(HashEntry));
 
         SoAQueueDeviceView q_view;
         q_view.r = reinterpret_cast<int*>(d_work_pool + offset_r);
@@ -499,10 +523,10 @@ py::tuple run_sycl_calculation(
         q_view.isForest = forestBool ? reinterpret_cast<int*>(d_work_pool + offset_is_forest) : nullptr;
         q_view.forest_int_count = forestBool ? reinterpret_cast<int*>(d_work_pool + offset_forest_int) : nullptr;
         q_view.node_infra = infraBool ? reinterpret_cast<float*>(d_work_pool + offset_infra) : nullptr;
-        q_view.hash_keys = d_hash_keys;
-        q_view.hash_slots = d_hash_slots;
+        q_view.hash_table = d_hash_table;
         q_view.num_workers = num_workers;
         q_view.capacity_per_path = capacity_per_path;
+        q_view.ring_mask = ring_mask;
         q_view.hash_capacity = hash_capacity;
         q_view.hash_mask = hash_mask;
 
@@ -511,10 +535,13 @@ py::tuple run_sycl_calculation(
         int init_counter = 0;
         q.memcpy(d_task_counter, &init_counter, sizeof(int));
 
-        // Diagnostic: Track maximum queue depth reached across all paths
+        // Diagnostic: Track maximum queue depth and peak active wavefront reached across all paths
         int* d_max_queue_depth = sycl::malloc_device<int>(1, q);
+        int* d_max_active_frontier = sycl::malloc_device<int>(1, q);
         int init_max_depth = 0;
+        int init_max_frontier = 0;
         q.memcpy(d_max_queue_depth, &init_max_depth, sizeof(int));
+        q.memcpy(d_max_active_frontier, &init_max_frontier, sizeof(int));
 
         // Host to Device copies
         q.memcpy(rel_indices, release_flat_indices.data(), num_release_cells * sizeof(int));
@@ -540,6 +567,8 @@ py::tuple run_sycl_calculation(
                 task_counter(*d_task_counter);
             sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
                 max_depth_tracker(*d_max_queue_depth);
+            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
+                max_frontier_tracker(*d_max_active_frontier);
 
             auto is_nodata = [=](float val) {
                 return sycl::isnan(val) || sycl::fabs(val - nodata) < 1e-3f;
@@ -565,6 +594,8 @@ py::tuple run_sycl_calculation(
             int q_idx = 0;
             int queue_size = 0;
             int my_task_id = -1;
+            uint16_t worker_gen = 0;
+            int local_max_frontier = 0;
 
             float thread_max_z_delta = max_z_delta;
             float thread_alpha = alpha;
@@ -576,6 +607,7 @@ py::tuple run_sycl_calculation(
                 if (has_work && (q_idx == queue_size)) {
                     if (queue_size > 0) {
                         max_depth_tracker.fetch_max(queue_size);
+                        max_frontier_tracker.fetch_max(local_max_frontier);
 
                         // Optimization B: Output accumulation (z_delta, flux, counts, forest_int) is done on-the-fly.
                         // The O(N^2) flush serialization loops are eliminated!
@@ -608,6 +640,7 @@ py::tuple run_sycl_calculation(
 
                         queue_size = 0;
                         q_idx = 0;
+                        local_max_frontier = 0;
                     }
 
                     my_task_id = task_counter.fetch_add(1);
@@ -619,6 +652,16 @@ py::tuple run_sycl_calculation(
                         if (is_neighborhood_valid(start_row, start_col)) {
                             queue_size = 0;
                             q_idx = 0;
+                            local_max_frontier = 0;
+
+                            worker_gen++;
+                            if (worker_gen == 0) {
+                                // Wrapped around 65,535 paths on this single worker: clear this worker's hash slice
+                                worker_gen = 1;
+                                for (size_t h = 0; h < q.hash_capacity; h++) {
+                                    q.hash_table[h * num_workers + static_cast<size_t>(worker_id)] = HashEntry{0u, 0u, 0u};
+                                }
+                            }
 
                             thread_max_z_delta = max_z_delta;
                             thread_alpha = alpha;
@@ -659,16 +702,13 @@ py::tuple run_sycl_calculation(
                                 q.forest_int_count[start_idx] = start_is_forest;
                             }
 
-                            // Register root cell (start_flat_index) at slot = 0 in q.hash_keys/hash_slots and increment counts[start_flat_index]
-                            uint64_t root_task_tag = static_cast<uint64_t>(my_task_id + 1);
-                            uint64_t root_target_key = (root_task_tag << 32) | static_cast<uint32_t>(start_flat_index);
+                            // Register root cell (start_flat_index) at ring_slot = 0 in q.hash_table and increment counts[start_flat_index]
                             uint32_t root_h = (static_cast<uint32_t>(start_flat_index) * 2654435761u) & q.hash_mask;
                             for (size_t probe = 0; probe < q.hash_capacity; probe++) {
                                 size_t h_idx = static_cast<size_t>(root_h) * num_workers + static_cast<size_t>(worker_id);
-                                uint64_t key_entry = q.hash_keys[h_idx];
-                                if ((key_entry >> 32) != root_task_tag) {
-                                    q.hash_keys[h_idx] = root_target_key;
-                                    q.hash_slots[h_idx] = 0u;
+                                HashEntry entry = q.hash_table[h_idx];
+                                if (entry.task_gen != worker_gen) {
+                                    q.hash_table[h_idx] = HashEntry{static_cast<uint32_t>(start_flat_index), worker_gen, 0u};
                                     break;
                                 }
                                 root_h = (root_h + 1) & q.hash_mask;
@@ -679,11 +719,13 @@ py::tuple run_sycl_calculation(
                         } else {
                             queue_size = 0;
                             q_idx = 0;
+                            local_max_frontier = 0;
                         }
                     } else {
                         has_work = false;
                         queue_size = 0;
                         q_idx = 0;
+                        local_max_frontier = 0;
                     }
                 }
 
@@ -692,6 +734,10 @@ py::tuple run_sycl_calculation(
                 }
 
                 if (has_work && (q_idx < queue_size)) {
+                    int active_now = queue_size - q_idx;
+                    if (active_now > local_max_frontier) {
+                        local_max_frontier = active_now;
+                    }
                     int curr_slot = q_idx++;
                     size_t curr_idx = q.idx(curr_slot, worker_id);
                     int curr_r = q.r[curr_idx];
@@ -700,6 +746,7 @@ py::tuple run_sycl_calculation(
                     float curr_flux = q.flux[curr_idx];
                     float curr_z_delta = q.z_delta[curr_idx];
                     uint8_t curr_is_start = q.is_start[curr_idx];
+                    q.is_start[curr_idx] = 2; // 2 = POPPED (no longer in active unpopped wavefront)
                     uint8_t curr_parent_is_start = q.parent_is_start[curr_idx];
                     float curr_min_distance = forestBool ? q.min_distance[curr_idx] : 0.0f;
                     float curr_minDistXYZ = forestBool ? q.minDistXYZ[curr_idx] : 0.0f;
@@ -1026,33 +1073,34 @@ py::tuple run_sycl_calculation(
                     int dc = nc - curr_c;
                     int flat = nr * cols + nc;
 
-                    // Optimization A: O(1) Tag-Versioned Decoupled SoA Hash Table Lookup
-                    uint64_t task_tag = static_cast<uint64_t>(my_task_id + 1);
-                    uint64_t target_key = (task_tag << 32) | static_cast<uint32_t>(flat);
+                    // Optimization A: O(1) Tag-Versioned Aligned HashEntry Table Lookup
                     uint32_t h = (static_cast<uint32_t>(flat) * 2654435761u) & q.hash_mask;
-
-                    int found_idx = -1;
+                    int found_slot = -1;
                     bool is_first_visit = false;
                     uint32_t target_h = h;
+                    bool slot_found_in_hash = false;
 
                     for (size_t probe = 0; probe < q.hash_capacity; probe++) {
                         size_t h_idx = static_cast<size_t>(h) * num_workers + static_cast<size_t>(worker_id);
-                        uint64_t key_entry = q.hash_keys[h_idx];
+                        HashEntry entry = q.hash_table[h_idx];
 
-                        if (key_entry == target_key) {
-                            // Coordinate was already visited earlier in this release path!
-                            int prev_slot = static_cast<int>(q.hash_slots[h_idx]);
-                            if (prev_slot >= q_idx) {
-                                // Still in the active unpopped frontier! Merge into prev_slot:
-                                found_idx = prev_slot;
+                        if (entry.task_gen == worker_gen && entry.flat_coord == static_cast<uint32_t>(flat)) {
+                            // Coordinate was already visited earlier in this path!
+                            uint16_t cand_slot = entry.ring_slot;
+                            size_t f_idx = q.idx(cand_slot, worker_id);
+                            // Check if cand_slot is STILL an active unpopped frontier node for (nr, nc):
+                            if (q.is_start[f_idx] != 2 && q.r[f_idx] == nr && q.c[f_idx] == nc) {
+                                found_slot = static_cast<int>(cand_slot);
                             }
                             target_h = h;
+                            slot_found_in_hash = true;
                             break;
                         }
-                        if ((key_entry >> 32) != task_tag) {
-                            // Unoccupied slot for this task -> First time this coordinate is visited in this path!
+                        if (entry.task_gen != worker_gen) {
+                            // Unoccupied bucket for this worker_gen -> First visit in this path!
                             is_first_visit = true;
                             target_h = h;
+                            slot_found_in_hash = true;
                             break;
                         }
                         h = (h + 1) & q.hash_mask;
@@ -1064,10 +1112,10 @@ py::tuple run_sycl_calculation(
                     float dist2d = sycl::sqrt(dx * dx + dy * dy);
                     float dist3d = forestBool ? sycl::sqrt(dy * dy + dy * dy + dz * dz) : 0.0f; // Replicate Python typo where dx is replaced by dy
 
-                    if (found_idx != -1) {
-                        size_t f_idx = q.idx(found_idx, worker_id);
+                    if (found_slot != -1) {
+                        size_t f_idx = q.idx(found_slot, worker_id);
                         q.flux[f_idx] += dist_val;
-                        q.parent_z_deltas[q.parent_zd_idx(found_idx, worker_id, 1 - dr, 1 - dc)] = curr_z_delta;
+                        q.parent_z_deltas[q.parent_zd_idx(found_slot, worker_id, 1 - dr, 1 - dc)] = curr_z_delta;
                         if (z_delta_neigh_val > q.z_delta[f_idx]) {
                             q.z_delta[f_idx] = z_delta_neigh_val;
                             q.parent_is_start[f_idx] = curr_is_start;
@@ -1095,20 +1143,24 @@ py::tuple run_sycl_calculation(
                             bool already_parent = false;
                             int np = q.num_parents[f_idx];
                             for (int p = 0; p < np; p++) {
-                                if (q.parent_indices[q.parent_idx(found_idx, worker_id, p)] == curr_slot) {
+                                if (q.parent_indices[q.parent_idx(found_slot, worker_id, p)] == curr_slot) {
                                     already_parent = true;
                                     break;
                                 }
                             }
                             if (!already_parent && np < 8) {
-                                q.parent_indices[q.parent_idx(found_idx, worker_id, np)] = curr_slot;
+                                q.parent_indices[q.parent_idx(found_slot, worker_id, np)] = curr_slot;
                                 q.num_parents[f_idx] = np + 1;
                             }
                         }
                     } else {
-                        if (queue_size < capacity_per_path) {
-                            size_t new_slot = static_cast<size_t>(queue_size++);
-                            size_t new_idx = q.idx(new_slot, worker_id);
+                        bool can_push = infraBool
+                            ? (static_cast<size_t>(queue_size) < capacity_per_path)
+                            : (static_cast<size_t>(queue_size - q_idx) < capacity_per_path);
+                        if (can_push) {
+                            size_t new_logical_slot = static_cast<size_t>(queue_size++);
+                            uint16_t new_ring_slot = static_cast<uint16_t>(new_logical_slot & q.ring_mask);
+                            size_t new_idx = q.idx(new_ring_slot, worker_id);
                             q.r[new_idx] = nr;
                             q.c[new_idx] = nc;
                             q.flux[new_idx] = dist_val;
@@ -1133,13 +1185,18 @@ py::tuple run_sycl_calculation(
                             
                             if (infraBool) {
                                 q.num_parents[new_idx] = 1;
-                                q.parent_indices[q.parent_idx(new_slot, worker_id, 0)] = curr_slot;
+                                q.parent_indices[q.parent_idx(new_logical_slot, worker_id, 0)] = curr_slot;
                             }
 
                             // Update hash table entry
-                            size_t target_h_idx = static_cast<size_t>(target_h) * num_workers + static_cast<size_t>(worker_id);
-                            q.hash_keys[target_h_idx] = target_key;
-                            q.hash_slots[target_h_idx] = static_cast<uint32_t>(new_slot);
+                            if (slot_found_in_hash) {
+                                size_t target_h_idx = static_cast<size_t>(target_h) * num_workers + static_cast<size_t>(worker_id);
+                                q.hash_table[target_h_idx] = HashEntry{
+                                    static_cast<uint32_t>(flat),
+                                    worker_gen,
+                                    new_ring_slot
+                                };
+                            }
 
                             // If first visit to this coordinate in this path, increment global visit count
                             if (is_first_visit) {
@@ -1155,16 +1212,20 @@ py::tuple run_sycl_calculation(
         });
         q.wait_and_throw();
 
-        // Query diagnostic peak queue depth
+        // Query diagnostic peak queue depth and peak active wavefront
         int host_max_queue_depth = 0;
+        int host_max_active_frontier = 0;
         q.memcpy(&host_max_queue_depth, d_max_queue_depth, sizeof(int));
+        q.memcpy(&host_max_active_frontier, d_max_active_frontier, sizeof(int));
         q.wait_and_throw();
         sycl::free(d_max_queue_depth, q);
+        sycl::free(d_max_active_frontier, q);
 
-        double queue_pct = (100.0 * host_max_queue_depth) / capacity_per_path;
-        std::cout << "[SYCL Diagnostic] Peak Queue Depth Reached: " << host_max_queue_depth 
-                  << " / " << capacity_per_path << " nodes (" << std::fixed << std::setprecision(1) 
-                  << queue_pct << "% capacity utilized)" << std::endl;
+        double ring_pct = (100.0 * host_max_active_frontier) / capacity_per_path;
+        std::cout << "[SYCL Diagnostic] Peak Active Wavefront: " << host_max_active_frontier 
+                  << " / " << capacity_per_path << " ring slots (" << std::fixed << std::setprecision(1) 
+                  << ring_pct << "% ring utilized) | Peak Total Path Length: " << host_max_queue_depth 
+                  << " cells" << std::endl;
 
         // Device to Host memory copies
         q.memcpy(host_z_delta.data(), z_delta, total_cells * sizeof(float));
@@ -1188,8 +1249,7 @@ py::tuple run_sycl_calculation(
         sycl::free(forest_map, q);
         sycl::free(backcalc, q);
         sycl::free(forest_int, q);
-        sycl::free(d_hash_keys, q);
-        sycl::free(d_hash_slots, q);
+        sycl::free(d_hash_table, q);
         sycl::free(d_work_pool, q);
         sycl::free(d_task_counter, q);
     }
