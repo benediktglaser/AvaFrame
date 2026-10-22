@@ -36,8 +36,20 @@ inline size_t next_pow2(size_t v) {
     return p;
 }
 
-inline size_t compute_hash_capacity(size_t capacity_per_path) {
-    return next_pow2(capacity_per_path + (capacity_per_path * 2) / 5);
+inline size_t compute_default_ring_capacity(size_t rows, size_t cols, size_t total_cells, bool infraBool) {
+    if (infraBool) {
+        // Infrastructure backtracking requires full path history in [0, queue_size)
+        return std::clamp<size_t>(next_pow2(total_cells / 16), 1024, 32768);
+    }
+    // Active 1D wavefront perimeter scales with grid cross-section 2 * (rows + cols)
+    // On avaParabola (401x1001): 2 * 1402 = 2804 -> next_pow2 = 4096
+    return std::clamp<size_t>(next_pow2(2 * (rows + cols)), 256, 65536);
+}
+
+inline size_t compute_default_hash_capacity(size_t total_cells) {
+    // Scale hash buckets with 2D DEM area (total_cells / 16)
+    // On avaParabola (401,401 cells): 401401 / 16 = 25087 -> next_pow2 = 32768
+    return std::clamp<size_t>(next_pow2(total_cells / 16), 1024, 262144);
 }
 
 struct SoAQueueDeviceView {
@@ -117,19 +129,28 @@ inline void atomic_min_float(float* addr, float val) {
     }
 }
 
-inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_release_cells, size_t total_cells, bool infraBool, bool forestBool) {
+inline WorkConfig determine_optimal_configuration(
+    sycl::queue& q,
+    size_t num_release_cells,
+    size_t rows,
+    size_t cols,
+    size_t total_cells,
+    bool infraBool,
+    bool forestBool
+) {
     auto dev = q.get_device();
     bool is_cpu = dev.is_cpu();
     size_t compute_units = dev.get_info<sycl::info::device::max_compute_units>();
     size_t global_mem = dev.get_info<sycl::info::device::global_mem_size>();
     std::string dev_name = dev.get_info<sycl::info::device::name>();
 
+    size_t capacity_per_path = compute_default_ring_capacity(rows, cols, total_cells, infraBool);
+    size_t hash_capacity = compute_default_hash_capacity(total_cells);
+    uint32_t hash_mask = static_cast<uint32_t>(hash_capacity - 1);
+    size_t bytes_per_node = soa_bytes_per_node(infraBool, forestBool);
+
     size_t num_workers = 1024;
     size_t work_group_size = 64;
-    size_t capacity_per_path = infraBool ? 32768 : 4096;
-    size_t hash_capacity = 32768;
-    uint32_t hash_mask = 32767;
-    size_t bytes_per_node = soa_bytes_per_node(infraBool, forestBool);
 
     if (is_cpu) {
         // For CPU devices, workers = CPU hardware threads/cores (e.g. 12 to 32)
@@ -143,14 +164,12 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
             std::cout << "[SYCL Dynamic Config] User override via ACPP_NUM_WORKERS: " << num_workers << " workers." << std::endl;
         }
 
-        capacity_per_path = infraBool ? 32768 : 4096;
         const char* env_q_cap = std::getenv("ACPP_QUEUE_CAPACITY");
         if (env_q_cap != nullptr) {
             capacity_per_path = std::min<size_t>(65536, next_pow2(std::stoul(env_q_cap)));
             std::cout << "[SYCL Dynamic Config] User override via ACPP_QUEUE_CAPACITY: " << capacity_per_path << " nodes/worker." << std::endl;
         }
 
-        hash_capacity = 32768;
         const char* env_hash_cap = std::getenv("ACPP_HASH_CAPACITY");
         if (env_hash_cap != nullptr) {
             hash_capacity = next_pow2(std::stoul(env_hash_cap));
@@ -159,8 +178,11 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
         hash_mask = static_cast<uint32_t>(hash_capacity - 1);
     } else {
         // Discrete GPU:
-        // Default work_group_size = 64 (2 warps on NVIDIA/AMD Wave32; 1 wavefront on Wave64)
-        work_group_size = 64;
+        // Query hardware subgroup sizes instead of hardcoding 64 blindly
+        auto sg_sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
+        size_t max_sg = sg_sizes.empty() ? 32 : *std::max_element(sg_sizes.begin(), sg_sizes.end());
+        work_group_size = std::clamp<size_t>(max_sg * 2, 32, 128); // 2 warps/wavefronts per WG (64 on NVIDIA/Wave32)
+
         const char* env_wg_size = std::getenv("ACPP_WORK_GROUP_SIZE");
         if (env_wg_size != nullptr) {
             work_group_size = std::stoul(env_wg_size);
@@ -189,7 +211,6 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
         }
         size_t vram_budget = static_cast<size_t>(global_mem * vram_fraction);
 
-        hash_capacity = 32768;
         const char* env_hash_cap = std::getenv("ACPP_HASH_CAPACITY");
         if (env_hash_cap != nullptr) {
             hash_capacity = next_pow2(std::stoul(env_hash_cap));
@@ -197,7 +218,7 @@ inline WorkConfig determine_optimal_configuration(sycl::queue& q, size_t num_rel
         }
         hash_mask = static_cast<uint32_t>(hash_capacity - 1);
 
-        size_t default_cap = infraBool ? 32768 : 4096;
+        size_t default_cap = capacity_per_path;
         const char* env_q_cap = std::getenv("ACPP_QUEUE_CAPACITY");
         if (env_q_cap != nullptr) {
             capacity_per_path = std::min<size_t>(65536, next_pow2(std::stoul(env_q_cap)));
@@ -437,7 +458,15 @@ py::tuple run_sycl_calculation(
         float* forest_int = sycl::malloc_device<float>(total_cells, q);
 
         // Dynamically determine optimal configuration based on hardware and terrain
-        WorkConfig config = determine_optimal_configuration(q, static_cast<size_t>(num_release_cells), total_cells, infraBool, forestBool);
+        WorkConfig config = determine_optimal_configuration(
+            q,
+            static_cast<size_t>(num_release_cells),
+            static_cast<size_t>(rows),
+            static_cast<size_t>(cols),
+            static_cast<size_t>(total_cells),
+            infraBool,
+            forestBool
+        );
         size_t num_workers = config.num_workers;
         size_t work_group_size = config.work_group_size;
         size_t capacity_per_path = config.capacity_per_path;
@@ -752,9 +781,22 @@ py::tuple run_sycl_calculation(
                     float curr_minDistXYZ = forestBool ? q.minDistXYZ[curr_idx] : 0.0f;
                     int curr_forest_int_count = (forestBool && forestInteraction) ? q.forest_int_count[curr_idx] : 0;
 
+                    // Calc detrainment and adjust current flux before committing to global flux array
+                    float current_flux = curr_flux;
+                    if (forestBool && forestDetrainmentBool && !curr_is_start) {
+                        float FSI_val = forest_map[curr_flat];
+                        float rest = maxDetrainmentFor * FSI_val;
+                        float slope = 0.0f;
+                        if (noDetrainmentEffectZdelta != 0.0f) {
+                            slope = (rest - minDetrainmentFor) / (0.0f - noDetrainmentEffectZdelta);
+                        }
+                        float detrainment = sycl::max(minDetrainmentFor, slope * curr_z_delta + rest);
+                        current_flux = sycl::max(0.0003f, current_flux - detrainment);
+                    }
+
                     // Optimization B: On-The-Fly Atomic Output Accumulation
                     atomic_max_float(&z_delta[curr_flat], curr_z_delta);
-                    atomic_max_float(&flux[curr_flat], curr_flux);
+                    atomic_max_float(&flux[curr_flat], current_flux);
                     if (forestBool && forestInteraction) {
                         atomic_min_float(&forest_int[curr_flat], static_cast<float>(curr_forest_int_count));
                     }
@@ -927,19 +969,6 @@ py::tuple run_sycl_calculation(
                             r_t[r][c] /= sum_rt;
                         }
                     }
-                }
-                
-                // Calc detrainment and adjust current flux
-                float current_flux = curr_flux;
-                if (forestBool && forestDetrainmentBool && !curr_is_start) {
-                    float FSI_val = forest_map[curr_flat];
-                    float rest = maxDetrainmentFor * FSI_val;
-                    float slope = 0.0f;
-                    if (noDetrainmentEffectZdelta != 0.0f) {
-                        slope = (rest - minDetrainmentFor) / (0.0f - noDetrainmentEffectZdelta);
-                    }
-                    float detrainment = sycl::max(minDetrainmentFor, slope * curr_z_delta + rest);
-                    current_flux = sycl::max(0.0003f, current_flux - detrainment);
                 }
 
                 // Calc dist
