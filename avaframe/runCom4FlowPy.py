@@ -229,7 +229,7 @@ def readFlowPyinputs(avalancheDir, cfgFlowPy, log):
     # TODO: also use the getAndCheckInputFiles to get the paths for the following files?
     # read infra area
     if cfgFlowPy.getboolean("GENERAL", "infra") is True:
-        infraPath, available = gI.getAndCheckInputFiles(inputDir, "INFRA", "Infra", fileExt="raster")
+        infraPath, available, _ = gI.getAndCheckInputFiles(inputDir, "INFRA", "Infra", fileExt="raster")
         if available == "No":
             message = f"There is no infra file in supported format provided in {avalancheDir}/INFRA"
             log.error(message)

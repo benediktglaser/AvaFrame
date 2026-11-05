@@ -102,30 +102,36 @@ inline constexpr size_t soa_bytes_per_node(bool infraBool, bool forestBool) {
 }
 
 inline void atomic_max_float(float* addr, float val) {
+    if (sycl::isnan(val)) return;
     uint32_t* u_addr = reinterpret_cast<uint32_t*>(addr);
-    uint32_t old_u = *u_addr;
-    float old_f = sycl::bit_cast<float>(old_u);
-    while (val > old_f || old_f == -9999.0f) {
-        uint32_t new_u = sycl::bit_cast<uint32_t>(val);
-        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> ref(*u_addr);
-        if (ref.compare_exchange_strong(old_u, new_u)) {
+    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> ref(*u_addr);
+    uint32_t old_u = ref.load();
+    while (true) {
+        float old_f = sycl::bit_cast<float>(old_u);
+        if (old_f != -9999.0f && old_f >= val) {
             break;
         }
-        old_f = sycl::bit_cast<float>(old_u);
+        uint32_t new_u = sycl::bit_cast<uint32_t>(val);
+        if (ref.compare_exchange_weak(old_u, new_u)) {
+            break;
+        }
     }
 }
 
 inline void atomic_min_float(float* addr, float val) {
+    if (sycl::isnan(val)) return;
     uint32_t* u_addr = reinterpret_cast<uint32_t*>(addr);
-    uint32_t old_u = *u_addr;
-    float old_f = sycl::bit_cast<float>(old_u);
-    while (val < old_f || old_f == 999999.0f) {
-        uint32_t new_u = sycl::bit_cast<uint32_t>(val);
-        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> ref(*u_addr);
-        if (ref.compare_exchange_strong(old_u, new_u)) {
+    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> ref(*u_addr);
+    uint32_t old_u = ref.load();
+    while (true) {
+        float old_f = sycl::bit_cast<float>(old_u);
+        if (old_f != 999999.0f && old_f <= val) {
             break;
         }
-        old_f = sycl::bit_cast<float>(old_u);
+        uint32_t new_u = sycl::bit_cast<uint32_t>(val);
+        if (ref.compare_exchange_weak(old_u, new_u)) {
+            break;
+        }
     }
 }
 
@@ -618,7 +624,6 @@ py::tuple run_sycl_calculation(
                 return true;
             };
 
-            sycl::sub_group sg = item.get_sub_group();
             bool has_work = true;
             int q_idx = 0;
             int queue_size = 0;
@@ -672,8 +677,12 @@ py::tuple run_sycl_calculation(
                         local_max_frontier = 0;
                     }
 
-                    my_task_id = task_counter.fetch_add(1);
-                    if (my_task_id < num_release_cells) {
+                    while (true) {
+                        my_task_id = task_counter.fetch_add(1);
+                        if (my_task_id >= num_release_cells) {
+                            has_work = false;
+                            break;
+                        }
                         int start_flat_index = rel_indices[my_task_id];
                         int start_row = start_flat_index / cols;
                         int start_col = start_flat_index % cols;
@@ -745,24 +754,16 @@ py::tuple run_sycl_calculation(
                             sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space> 
                                 atomic_counts(counts[start_flat_index]);
                             atomic_counts.fetch_add(1);
-                        } else {
-                            queue_size = 0;
-                            q_idx = 0;
-                            local_max_frontier = 0;
+                            break;
                         }
-                    } else {
-                        has_work = false;
-                        queue_size = 0;
-                        q_idx = 0;
-                        local_max_frontier = 0;
                     }
                 }
 
-                if (sycl::none_of_group(sg, has_work)) {
+                if (!has_work) {
                     break;
                 }
 
-                if (has_work && (q_idx < queue_size)) {
+                if (q_idx < queue_size) {
                     int active_now = queue_size - q_idx;
                     if (active_now > local_max_frontier) {
                         local_max_frontier = active_now;

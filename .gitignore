@@ -74,3 +74,11 @@ avaframe/com4FlowPy/sycl/*.so
 *.nsys-rep
 *.ncu-rep
 *.sqlite
+
+# Benchmark and profiling archives
+/benchmark_and_profiling_data/
+testCaseXL*
+avaframe/com4FlowPy/sycl/__init__.py
+benchmark_testCaseXL.py
+sbatch_vsc5_xl_*.sh
+
